@@ -1,2 +1,27 @@
 <!DOCTYPE html>
-<html><body><h1>PCEA Kiigene — coming soon</h1></body></html>
+<html>
+<head><meta charset="utf-8"><title>PCEA Kiigene Church</title></head>
+<body>
+  <h1 id="churchName">Loading…</h1>
+  <p id="churchLocation"></p>
+  <h2>Ministries</h2>
+  <ul id="ministryList"></ul>
+  <h2>Upcoming Events</h2>
+  <ul id="eventList"></ul>
+
+<script>
+fetch('/api/content')
+  .then(r => r.json())
+  .then(data => {
+    if (!data.ok) { document.body.innerHTML = 'Error: ' + data.error; return; }
+    document.getElementById('churchName').textContent = data.church?.name || 'PCEA Kiigene Church';
+    document.getElementById('churchLocation').textContent = data.church?.location || '';
+    document.getElementById('ministryList').innerHTML = data.ministries
+      .map(m => `<li>${m.name} — ${m.tagline || ''}</li>`).join('');
+    document.getElementById('eventList').innerHTML = data.events
+      .map(e => `<li>${e.title} — ${e.event_date} ${e.event_time || ''} @ ${e.place || ''}</li>`).join('');
+  })
+  .catch(err => { document.body.textContent = 'Fetch failed: ' + err.message; });
+</script>
+</body>
+</html>
