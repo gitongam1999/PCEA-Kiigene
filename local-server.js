@@ -7,6 +7,7 @@ app.get('/api/ping', require('./api/ping'));
 app.get('/api/content', require('./api/content'));
 app.get('/api/session-check', require('./api/session-check'));
 app.all('/api/auth', require('./api/auth'));
+app.all('/api/admin', require('./api/admin'));
 app.get('/admin.html', (req, res) => res.sendFile(require('path').join(__dirname, 'admin.html')));
 app.get('/admin-dashboard', require('./api/dashboard'));
 
