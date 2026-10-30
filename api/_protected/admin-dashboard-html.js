@@ -54,13 +54,13 @@ module.exports = `<!DOCTYPE html>
 <div class="wrap">
   <div class="tabs" id="tabs"></div>
   <div class="split">
-    <div class="panel"><h3 id="formTitle">Add</h3><div id="formArea"></div></div>
+    <div class="panel" id="formPanel"><h3 id="formTitle">Add</h3><div id="formArea"></div></div>
     <div class="panel"><h3 id="listTitle">Current</h3><div id="listArea"><div class="msg">Loading…</div></div></div>
   </div>
 </div>
 
 <script>
-const TABS = [['events','Events'],['videos','Videos'],['albums','Photos'],['sermons','Sermons'],['leaders','Leadership']];
+const TABS = [['ministries','Ministries'],['events','Events'],['videos','Videos'],['albums','Photos'],['sermons','Sermons'],['leaders','Leadership']];
 let tab = 'events';
 let content = null;
 
@@ -82,7 +82,7 @@ function formFor(t){
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
     <div class="field"><label>Title</label><input id="f_title" placeholder="Men's Fellowship Gathering"></div>
     <div class="field"><label>Description</label><textarea id="f_description" rows="2"></textarea></div>
-    <div class="field"><label style="color:#857d91">File upload comes with the Cloudflare R2 step — not yet.</label></div>
+    <div class="field"><label style="color:#857d91">Video file upload comes in a later step — not yet.</label></div>
     <button class="btn" id="addBtn">Publish video</button>\`;
   if (t==='albums') return \`
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
@@ -119,6 +119,9 @@ function render(){
   document.getElementById('tabs').innerHTML = TABS.map(([k,l]) =>
     '<button class="tab '+(k===tab?'on':'')+'" data-tab="'+k+'">'+l+'</button>').join('');
   document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; render(); });
+
+  if (tab === 'ministries') { renderMinistries(); return; }
+  document.getElementById('formPanel').style.display = '';
 
   document.getElementById('formTitle').textContent = 'Add ' + tab.replace(/s$/,'');
   document.getElementById('formArea').innerHTML = formFor(tab);
@@ -160,6 +163,87 @@ async function deleteItem(id){
     const r = await fetch('/api/admin?table=' + tab + '&id=' + encodeURIComponent(id), { method: 'DELETE' });
     const res = await r.json();
     if (!res.ok) { alert('Error: ' + res.error); return; }
+    await loadContent();
+  } catch (e) { alert('Could not reach the server.'); }
+}
+
+function renderMinistries(){
+  document.getElementById('formPanel').style.display = 'none';
+  document.getElementById('listTitle').textContent = 'Ministry Cover Photos';
+  var mins = content.ministries || [];
+  var html = '<div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">';
+  mins.forEach(function(m){
+    var pic = m.cover_url
+      ? '<img src="' + m.cover_url + '" alt="" style="width:100%;height:100%;object-fit:cover;display:block">'
+      : '<div style="width:100%;height:100%;display:flex;align-items:center;justify-content:center;color:#999;font-size:12px">No cover yet</div>';
+    var removeBtn = m.cover_url
+      ? '<button class="del" data-remove-cover="' + m.id + '" title="Remove cover">✕</button>'
+      : '';
+    html += '<div style="border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff">' +
+      '<div style="aspect-ratio:16/9;background:#eee">' + pic + '</div>' +
+      '<div style="padding:10px">' +
+        '<b style="display:block;font-size:14px;margin-bottom:8px">' + m.name + '</b>' +
+        '<input type="file" accept="image/*" id="cf_' + m.id + '" style="display:block;width:100%;font-size:12px;margin-bottom:8px">' +
+        '<div style="display:flex;gap:6px">' +
+          '<button class="btn" style="flex:1;padding:7px 0;font-size:12.5px" data-upload-cover="' + m.id + '">Upload</button>' +
+          removeBtn +
+        '</div>' +
+        '<div id="cs_' + m.id + '" style="font-size:11.5px;color:#857d91;margin-top:6px"></div>' +
+      '</div></div>';
+  });
+  html += '</div>';
+  document.getElementById('listArea').innerHTML = html;
+
+  document.querySelectorAll('[data-upload-cover]').forEach(function(b){
+    b.onclick = function(){ handleCoverUpload(b.dataset.uploadCover); };
+  });
+  document.querySelectorAll('[data-remove-cover]').forEach(function(b){
+    b.onclick = function(){ handleCoverRemove(b.dataset.removeCover); };
+  });
+}
+
+async function handleCoverUpload(ministryId){
+  const fileInput = document.getElementById('cf_'+ministryId);
+  const status = document.getElementById('cs_'+ministryId);
+  const file = fileInput.files[0];
+  if (!file) { status.textContent = 'Choose a file first.'; return; }
+  if (!file.type.startsWith('image/')) { status.textContent = 'Please choose an image file.'; return; }
+  if (file.size > 30*1024*1024) { status.textContent = 'failed: image file above 30mbs'; return; }
+
+  status.textContent = 'Requesting upload link…';
+  try {
+    const r1 = await fetch('/api/admin', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action:'get-upload-url', kind:'cover', filename:file.name, contentType:file.type, sizeBytes:file.size })
+    });
+    const d1 = await r1.json();
+    if (!d1.ok) { status.textContent = 'Error: ' + d1.error; return; }
+
+    status.textContent = 'Uploading…';
+    const r2 = await fetch(d1.uploadUrl, { method:'PUT', headers:{'Content-Type':file.type}, body:file });
+    if (!r2.ok) { status.textContent = 'Upload to storage failed.'; return; }
+
+    status.textContent = 'Saving…';
+    const r3 = await fetch('/api/admin', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ action:'attach-cover', ministryId, key:d1.key, contentType:file.type, sizeBytes:file.size, originalName:file.name })
+    });
+    const d3 = await r3.json();
+    if (!d3.ok) { status.textContent = 'Error: ' + d3.error; return; }
+
+    status.textContent = 'Done.';
+    await loadContent();
+  } catch (e) {
+    status.textContent = 'Could not reach the server.';
+  }
+}
+
+async function handleCoverRemove(ministryId){
+  if (!confirm('Remove this cover photo?')) return;
+  try {
+    const r = await fetch('/api/admin?action=remove-cover&ministryId=' + encodeURIComponent(ministryId), { method:'DELETE' });
+    const d = await r.json();
+    if (!d.ok) { alert('Error: ' + d.error); return; }
     await loadContent();
   } catch (e) { alert('Could not reach the server.'); }
 }
