@@ -17,6 +17,14 @@ function safeKey(prefix, filename) {
   return `${prefix}/${Date.now()}-${clean}`;
 }
 
+// The Home page's cover photo lives on the church_info row.
+// Every other ministry keeps its cover on its own ministries row.
+function coverTarget(ministryId) {
+  return ministryId === 'home'
+    ? { table: 'church_info', id: 1 }
+    : { table: 'ministries', id: ministryId };
+}
+
 module.exports = async (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ ok: false, error: 'Not signed in.' });
 
@@ -25,14 +33,15 @@ module.exports = async (req, res) => {
 
     if (action === 'remove-cover') {
       if (!ministryId) return res.status(400).json({ ok: false, error: 'Missing ministryId.' });
-      const { data: m, error: mErr } = await supabase.from('ministries')
-        .select('cover_url').eq('id', ministryId).single();
+      const t = coverTarget(ministryId);
+      const { data: m, error: mErr } = await supabase.from(t.table)
+        .select('cover_url').eq('id', t.id).single();
       if (mErr) return res.status(500).json({ ok: false, error: mErr.message });
       if (m && m.cover_url) {
         try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: m.cover_url })); } catch (e) {}
         await supabase.from('media_files').delete().eq('b2_key', m.cover_url);
       }
-      const { error } = await supabase.from('ministries').update({ cover_url: null }).eq('id', ministryId);
+      const { error } = await supabase.from(t.table).update({ cover_url: null }).eq('id', t.id);
       if (error) return res.status(500).json({ ok: false, error: error.message });
       return res.status(200).json({ ok: true });
     }
@@ -72,8 +81,9 @@ module.exports = async (req, res) => {
     if (body.action === 'attach-cover') {
       const { ministryId, key, contentType, sizeBytes, originalName } = body;
       if (!ministryId || !key) return res.status(400).json({ ok: false, error: 'Missing ministryId or key.' });
+      const t = coverTarget(ministryId);
 
-      const { data: m } = await supabase.from('ministries').select('cover_url').eq('id', ministryId).single();
+      const { data: m } = await supabase.from(t.table).select('cover_url').eq('id', t.id).single();
       if (m && m.cover_url && m.cover_url !== key) {
         try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: m.cover_url })); } catch (e) {}
         await supabase.from('media_files').delete().eq('b2_key', m.cover_url);
@@ -84,7 +94,7 @@ module.exports = async (req, res) => {
       });
       if (e1) return res.status(500).json({ ok: false, error: e1.message });
 
-      const { error: e2 } = await supabase.from('ministries').update({ cover_url: key }).eq('id', ministryId);
+      const { error: e2 } = await supabase.from(t.table).update({ cover_url: key }).eq('id', t.id);
       if (e2) return res.status(500).json({ ok: false, error: e2.message });
 
       return res.status(200).json({ ok: true });

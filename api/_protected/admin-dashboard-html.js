@@ -170,7 +170,8 @@ async function deleteItem(id){
 function renderMinistries(){
   document.getElementById('formPanel').style.display = 'none';
   document.getElementById('listTitle').textContent = 'Ministry Cover Photos';
-  var mins = content.ministries || [];
+  var homeCard = { id: 'home', name: 'Home page', cover_url: (content.church && content.church.cover_url) || null };
+  var mins = [homeCard].concat(content.ministries || []);
   var html = '<div style="display:grid;gap:14px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">';
   mins.forEach(function(m){
     var pic = m.cover_url

@@ -1,5 +1,11 @@
 const supabase = require('./_db');
-const { s3, BUCKET, presignGet } = require('./_storage');
+const { BUCKET, presignGet } = require('./_storage');
+
+// Private-bucket files are stored as keys; turn a key into a temporary viewing link.
+async function sign(key) {
+  if (!key) return null;
+  try { return await presignGet(BUCKET, key, 3600); } catch (e) { return null; }
+}
 
 module.exports = async (req, res) => {
   try {
@@ -18,14 +24,8 @@ module.exports = async (req, res) => {
       .find(r => r.error);
     if (firstError) return res.status(500).json({ ok: false, error: firstError.error.message });
 
-    if (ministries.data) {
-      await Promise.all(ministries.data.map(async m => {
-        if (m.cover_url) {
-          try { m.cover_url = await presignGet(BUCKET, m.cover_url, 3600); }
-          catch (e) { m.cover_url = null; }
-        }
-      }));
-    }
+    await Promise.all((ministries.data || []).map(async m => { m.cover_url = await sign(m.cover_url); }));
+    if (church.data) church.data.cover_url = await sign(church.data.cover_url);
 
     res.status(200).json({
       ok: true,
