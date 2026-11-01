@@ -443,7 +443,7 @@ function adapt(api){
     sermons:(api.sermons||[]).map(s=>({
       id:s.id, title:s.title, who:s.preacher||"", date:fmtDate(s.sermon_date), len:"" 
     })),
-    leaders:(api.leaders||[]).map(l=>({id:l.id,name:l.name,role:l.role,note:l.note||""}))
+    leaders:(api.leaders||[]).map(l=>({id:l.id,name:l.name,role:l.role,note:l.note||"",img:l.photo_url||null}))
   };
 }
 
@@ -681,7 +681,7 @@ function pageLeadership(){
   + `<div class="wrap"><section>
     ${secHead("Church Committee")}
     <div class="grid g-people">${db.leaders.map((p,i)=>`
-      <div class="person"><div class="ph-wrap">${phPerson(i)}</div>
+      <div class="person"><div class="ph-wrap">${p.img?`<img src="${p.img}" alt="" style="display:block;width:100%;aspect-ratio:1;object-fit:cover;object-position:50% 25%">`:phPerson(i)}</div>
         <div class="pbody"><div class="role">${p.role}</div>
           <h4>${p.name}</h4>${p.note?`<div class="note">${p.note}</div>`:''}</div></div>`).join('')}
     </div></section>

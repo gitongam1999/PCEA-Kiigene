@@ -77,7 +77,7 @@ function formFor(t){
     <div class="field"><label>Time</label><input id="f_event_time" placeholder="10:30am"></div>
     <div class="field"><label>Venue</label><input id="f_place" placeholder="Main Sanctuary"></div>
     <div class="field"><label>Description</label><textarea id="f_description" rows="2"></textarea></div>
-    <div class="field"><label>Event image (optional)</label><input type="file" id="ev_file" accept="image/*"><div style="font-size:12px;color:#857d91;margin-top:5px">Landscape 16:9 works best. Other shapes are trimmed to fit. Max 30MB.</div></div>
+    <div class="field"><label>Event image (optional)</label><input type="file" id="photo_file" accept="image/*"><div style="font-size:12px;color:#857d91;margin-top:5px">Landscape 16:9 works best (other shapes are trimmed). Photos are shrunk to under 0.8MB automatically; files over 30MB are refused.</div></div>
     <button class="btn" id="addBtn">Publish event</button>\`;
   if (t==='videos') return \`
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
@@ -98,6 +98,7 @@ function formFor(t){
     <div class="field"><label>Name</label><input id="f_name" placeholder="Mrs. A. Kanana"></div>
     <div class="field"><label>Role</label><input id="f_role" placeholder="Secretary"></div>
     <div class="field"><label>Note</label><input id="f_note" placeholder="Church committee"></div>
+    <div class="field"><label>Photo (optional)</label><input type="file" id="photo_file" accept="image/*"><div style="font-size:12px;color:#857d91;margin-top:5px">A clear head-and-shoulders photo works best. It is shrunk to under 0.8MB automatically.</div></div>
     <button class="btn" id="addBtn">Add to leadership</button>\`;
 }
 
@@ -139,6 +140,55 @@ function render(){
   document.querySelectorAll('[data-id]').forEach(b => b.onclick = () => deleteItem(b.dataset.id));
 }
 
+const MAX_PHOTO_BYTES = 800 * 1024;   // every photo is shrunk to under 0.8MB
+const MAX_PHOTO_SIDE = 1920;          // longest side, in pixels
+const PHOTO_FIELD = { events: 'image_url', leaders: 'photo_url' };   // which column holds each tab's photo
+
+function loadImage(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function(){ URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error('unreadable')); };
+    img.src = url;
+  });
+}
+
+function canvasToJpeg(canvas, quality){
+  return new Promise(function(resolve){ canvas.toBlob(resolve, 'image/jpeg', quality); });
+}
+
+async function shrinkPhoto(file){
+  if (file.size <= MAX_PHOTO_BYTES) return file;   // already small: leave it untouched
+  var img = await loadImage(file);
+  var scale = Math.min(1, MAX_PHOTO_SIDE / Math.max(img.naturalWidth, img.naturalHeight));
+  var w = Math.round(img.naturalWidth * scale);
+  var h = Math.round(img.naturalHeight * scale);
+  var canvas = document.createElement('canvas');
+  var blob = null;
+  while (true) {
+    canvas.width = w; canvas.height = h;
+    var ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(img, 0, 0, w, h);
+    var q = 0.85;
+    while (q >= 0.5) {
+      blob = await canvasToJpeg(canvas, q);
+      if (blob && blob.size <= MAX_PHOTO_BYTES) break;
+      q -= 0.07;
+    }
+    if (blob && blob.size <= MAX_PHOTO_BYTES) break;
+    if (Math.max(w, h) <= 400) break;
+    w = Math.round(w * 0.85);
+    h = Math.round(h * 0.85);
+  }
+  if (!blob) throw new Error('unreadable');
+  var dot = file.name.lastIndexOf('.');
+  var base = dot > 0 ? file.name.slice(0, dot) : file.name;
+  return new File([blob], base + '.jpg', { type: 'image/jpeg' });
+}
+
 async function addItem(){
   const btn = document.getElementById('addBtn');
   const label = btn.textContent;
@@ -152,12 +202,15 @@ async function addItem(){
   const payload = { table: tab, data: data };
   btn.disabled = true;
   try {
-    const fileInput = document.getElementById('ev_file');
-    const file = (tab === 'events' && fileInput) ? fileInput.files[0] : null;
+    const fileInput = document.getElementById('photo_file');
+    let file = (PHOTO_FIELD[tab] && fileInput) ? fileInput.files[0] : null;
     if (file) {
       if (!file.type.startsWith('image/')) { alert('Please choose an image file.'); btn.disabled = false; return; }
       if (file.size > 30*1024*1024) { alert('failed: image file above 30mbs'); btn.disabled = false; return; }
-      btn.textContent = 'Uploading image…';
+      btn.textContent = 'Shrinking photo…';
+      try { file = await shrinkPhoto(file); }
+      catch (e) { alert('This image could not be read. Please use a JPG or PNG photo.'); btn.disabled = false; btn.textContent = label; return; }
+      btn.textContent = 'Uploading photo…';
       const r1 = await fetch('/api/admin', {
         method: 'POST', headers: {'Content-Type':'application/json'},
         body: JSON.stringify({ action:'get-upload-url', kind:'image', filename:file.name, contentType:file.type, sizeBytes:file.size })
@@ -166,7 +219,7 @@ async function addItem(){
       if (!d1.ok) { alert('Error: ' + d1.error); btn.disabled = false; btn.textContent = label; return; }
       const r2 = await fetch(d1.uploadUrl, { method:'PUT', headers:{'Content-Type':file.type}, body:file });
       if (!r2.ok) { alert('Upload to storage failed.'); btn.disabled = false; btn.textContent = label; return; }
-      data.image_url = d1.key;
+      data[PHOTO_FIELD[tab]] = d1.key;
       payload.media = { key:d1.key, kind:'image', contentType:file.type, sizeBytes:file.size, originalName:file.name };
     }
     btn.textContent = 'Publishing…';
@@ -229,10 +282,14 @@ function renderMinistries(){
 async function handleCoverUpload(ministryId){
   const fileInput = document.getElementById('cf_'+ministryId);
   const status = document.getElementById('cs_'+ministryId);
-  const file = fileInput.files[0];
+  let file = fileInput.files[0];
   if (!file) { status.textContent = 'Choose a file first.'; return; }
   if (!file.type.startsWith('image/')) { status.textContent = 'Please choose an image file.'; return; }
   if (file.size > 30*1024*1024) { status.textContent = 'failed: image file above 30mbs'; return; }
+
+  status.textContent = 'Shrinking photo…';
+  try { file = await shrinkPhoto(file); }
+  catch (e) { status.textContent = 'This image could not be read. Please use a JPG or PNG photo.'; return; }
 
   status.textContent = 'Requesting upload link…';
   try {
