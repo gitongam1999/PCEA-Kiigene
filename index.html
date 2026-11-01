@@ -303,6 +303,32 @@ footer .copy{width:100%;border-top:1px solid rgba(255,255,255,.14);margin-top:16
   .sermon{flex-direction:column}
   .sermon .sicon{width:100%;height:52px;border-right:0;border-bottom:1px solid var(--line)}
 }
+/* Swipeable rows on the home and ministry pages */
+#app[data-list="0"] .g-events,
+#app[data-list="0"] .g-videos,
+#app[data-list="0"] .g-photos{
+  display:flex;gap:14px;overflow-x:auto;overflow-y:hidden;
+  scroll-snap-type:x proximity;overscroll-behavior-x:contain;
+  -webkit-overflow-scrolling:touch;scrollbar-width:none;
+  margin:0 -18px;padding:4px 18px 14px;scroll-padding-left:18px;
+}
+#app[data-list="0"] .g-events::-webkit-scrollbar,
+#app[data-list="0"] .g-videos::-webkit-scrollbar,
+#app[data-list="0"] .g-photos::-webkit-scrollbar{display:none}
+#app[data-list="0"] .g-events > *{flex:0 0 min(78vw,270px);scroll-snap-align:start}
+#app[data-list="0"] .g-videos > *{flex:0 0 min(84vw,320px);scroll-snap-align:start}
+#app[data-list="0"] .g-photos > *{flex:0 0 min(44vw,175px);scroll-snap-align:start}
+@media (hover:hover) and (pointer:fine){
+  #app[data-list="0"] .g-events,
+  #app[data-list="0"] .g-videos,
+  #app[data-list="0"] .g-photos{scrollbar-width:thin}
+  #app[data-list="0"] .g-events::-webkit-scrollbar,
+  #app[data-list="0"] .g-videos::-webkit-scrollbar,
+  #app[data-list="0"] .g-photos::-webkit-scrollbar{display:block;height:8px}
+  #app[data-list="0"] .g-events::-webkit-scrollbar-thumb,
+  #app[data-list="0"] .g-videos::-webkit-scrollbar-thumb,
+  #app[data-list="0"] .g-photos::-webkit-scrollbar-thumb{background:#c9c9d3;border-radius:4px}
+}
 </style>
 </head>
 <body>
@@ -405,7 +431,7 @@ function adapt(api){
     events:(api.events||[]).map(e=>{
       const dm=dayMon(e.event_date);
       return {id:e.id, ministry:minName(e.ministry_id), title:e.title, day:dm.day, mon:dm.mon,
-        time:e.event_time||"", place:e.place||"", desc:e.description||""};
+        time:e.event_time||"", place:e.place||"", desc:e.description||"", img:e.image_url||null};
     }),
     videos:(api.videos||[]).map(v=>({
       id:v.id, ministry:minName(v.ministry_id), title:v.title,
@@ -506,7 +532,7 @@ function secHead(t,more){
 }
 function eventCard(e,i){
   return `<article class="card">
-    <div class="thumb">${ph(i+hashNum(String(e.id)))}<span class="chip">${e.ministry}</span>
+    <div class="thumb">${e.img?`<img src="${e.img}" alt="" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">`:ph(i+hashNum(String(e.id)))}<span class="chip">${e.ministry}</span>
       <span class="datebox"><b>${e.day}</b><i>${e.mon}</i></span></div>
     <div class="card-body"><h4>${e.title}</h4>
       <div class="meta"><svg class="icon icon-sm" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/>
@@ -773,6 +799,7 @@ function render(){
   const hash=location.hash.replace(/^#\/?/,'') || 'home';
   const [route,param]=hash.split('?');
   applyTheme(route);
+  document.getElementById('app').dataset.list = ['events','videos','photos','sermons','search'].includes(route) ? '1' : '0';
   let html;
   if(route==='home') html=pageHome();
   else if(route==='leadership') html=pageLeadership();

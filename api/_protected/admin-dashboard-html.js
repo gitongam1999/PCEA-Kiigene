@@ -77,6 +77,7 @@ function formFor(t){
     <div class="field"><label>Time</label><input id="f_event_time" placeholder="10:30am"></div>
     <div class="field"><label>Venue</label><input id="f_place" placeholder="Main Sanctuary"></div>
     <div class="field"><label>Description</label><textarea id="f_description" rows="2"></textarea></div>
+    <div class="field"><label>Event image (optional)</label><input type="file" id="ev_file" accept="image/*"><div style="font-size:12px;color:#857d91;margin-top:5px">Landscape 16:9 works best. Other shapes are trimmed to fit. Max 30MB.</div></div>
     <button class="btn" id="addBtn">Publish event</button>\`;
   if (t==='videos') return \`
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
@@ -140,21 +141,43 @@ function render(){
 
 async function addItem(){
   const btn = document.getElementById('addBtn');
+  const label = btn.textContent;
   const data = {};
   document.querySelectorAll('#formArea [id^="f_"]').forEach(el => {
     data[el.id.slice(2)] = el.value.trim();
   });
   if (!data.title && !data.name) { alert('Please fill in the title/name field.'); return; }
-  btn.disabled = true; btn.textContent = 'Publishing…';
+  if (tab === 'events' && !data.event_date) { alert('Please choose the event date.'); return; }
+
+  const payload = { table: tab, data: data };
+  btn.disabled = true;
   try {
+    const fileInput = document.getElementById('ev_file');
+    const file = (tab === 'events' && fileInput) ? fileInput.files[0] : null;
+    if (file) {
+      if (!file.type.startsWith('image/')) { alert('Please choose an image file.'); btn.disabled = false; return; }
+      if (file.size > 30*1024*1024) { alert('failed: image file above 30mbs'); btn.disabled = false; return; }
+      btn.textContent = 'Uploading image…';
+      const r1 = await fetch('/api/admin', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'get-upload-url', kind:'image', filename:file.name, contentType:file.type, sizeBytes:file.size })
+      });
+      const d1 = await r1.json();
+      if (!d1.ok) { alert('Error: ' + d1.error); btn.disabled = false; btn.textContent = label; return; }
+      const r2 = await fetch(d1.uploadUrl, { method:'PUT', headers:{'Content-Type':file.type}, body:file });
+      if (!r2.ok) { alert('Upload to storage failed.'); btn.disabled = false; btn.textContent = label; return; }
+      data.image_url = d1.key;
+      payload.media = { key:d1.key, kind:'image', contentType:file.type, sizeBytes:file.size, originalName:file.name };
+    }
+    btn.textContent = 'Publishing…';
     const r = await fetch('/api/admin', {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ table: tab, data })
+      body: JSON.stringify(payload)
     });
     const res = await r.json();
-    if (!res.ok) { alert('Error: ' + res.error); btn.disabled = false; btn.textContent = 'Publish'; return; }
+    if (!res.ok) { alert('Error: ' + res.error); btn.disabled = false; btn.textContent = label; return; }
     await loadContent();
-  } catch (e) { alert('Could not reach the server.'); btn.disabled = false; }
+  } catch (e) { alert('Could not reach the server.'); btn.disabled = false; btn.textContent = label; }
 }
 
 async function deleteItem(id){

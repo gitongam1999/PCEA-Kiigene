@@ -26,6 +26,7 @@ module.exports = async (req, res) => {
 
     await Promise.all((ministries.data || []).map(async m => { m.cover_url = await sign(m.cover_url); }));
     if (church.data) church.data.cover_url = await sign(church.data.cover_url);
+    await Promise.all((events.data || []).map(async e => { e.image_url = await sign(e.image_url); }));
 
     res.status(200).json({
       ok: true,

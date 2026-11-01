@@ -7,6 +7,16 @@ const ALLOWED = ['events', 'videos', 'albums', 'sermons', 'leaders'];
 const STORAGE_CAP_BYTES = 9.5 * 1024 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
 
+// Which columns on each table hold a stored file's key.
+// When a row is deleted, its files are deleted too.
+const FILE_COLUMNS = {
+  events: ['image_url'],
+  videos: ['file_url', 'thumbnail_url'],
+  albums: [],
+  sermons: ['audio_url', 'video_url'],
+  leaders: ['photo_url']
+};
+
 async function storageUsed() {
   const { data, error } = await supabase.from('media_files').select('size_bytes');
   if (error) throw new Error(error.message);
@@ -15,6 +25,15 @@ async function storageUsed() {
 function safeKey(prefix, filename) {
   const clean = (filename || 'file').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-80);
   return `${prefix}/${Date.now()}-${clean}`;
+}
+
+// Delete files from the bucket and stop counting them toward the storage limit.
+async function removeFiles(keys) {
+  for (const key of keys) {
+    if (!key) continue;
+    try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key })); } catch (e) {}
+    await supabase.from('media_files').delete().eq('b2_key', key);
+  }
 }
 
 // The Home page's cover photo lives on the church_info row.
@@ -37,18 +56,23 @@ module.exports = async (req, res) => {
       const { data: m, error: mErr } = await supabase.from(t.table)
         .select('cover_url').eq('id', t.id).single();
       if (mErr) return res.status(500).json({ ok: false, error: mErr.message });
-      if (m && m.cover_url) {
-        try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: m.cover_url })); } catch (e) {}
-        await supabase.from('media_files').delete().eq('b2_key', m.cover_url);
-      }
+      if (m && m.cover_url) await removeFiles([m.cover_url]);
       const { error } = await supabase.from(t.table).update({ cover_url: null }).eq('id', t.id);
       if (error) return res.status(500).json({ ok: false, error: error.message });
       return res.status(200).json({ ok: true });
     }
 
     if (!ALLOWED.includes(table)) return res.status(400).json({ ok: false, error: 'Unknown table.' });
+
+    const cols = FILE_COLUMNS[table] || [];
+    let keys = [];
+    if (cols.length) {
+      const { data: old } = await supabase.from(table).select(cols.join(',')).eq('id', id).single();
+      if (old) keys = cols.map(c => old[c]).filter(Boolean);
+    }
     const { error } = await supabase.from(table).delete().eq('id', id);
     if (error) return res.status(500).json({ ok: false, error: error.message });
+    await removeFiles(keys);
     return res.status(200).json({ ok: true });
   }
 
@@ -84,10 +108,7 @@ module.exports = async (req, res) => {
       const t = coverTarget(ministryId);
 
       const { data: m } = await supabase.from(t.table).select('cover_url').eq('id', t.id).single();
-      if (m && m.cover_url && m.cover_url !== key) {
-        try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: m.cover_url })); } catch (e) {}
-        await supabase.from('media_files').delete().eq('b2_key', m.cover_url);
-      }
+      if (m && m.cover_url && m.cover_url !== key) await removeFiles([m.cover_url]);
 
       const { error: e1 } = await supabase.from('media_files').insert({
         b2_key: key, kind: 'cover', content_type: contentType, original_name: originalName, size_bytes: sizeBytes || 0
@@ -100,10 +121,27 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
-    const { table, data } = body;
+    // Create a row (event, video, album, sermon, leader), optionally with one uploaded file.
+    const { table, media } = body;
+    const data = body.data || {};
     if (!ALLOWED.includes(table)) return res.status(400).json({ ok: false, error: 'Unknown table.' });
+
+    // Empty form boxes should be saved as "nothing", not as empty text.
+    Object.keys(data).forEach(k => { if (data[k] === '') data[k] = null; });
+
+    if (media && media.key) {
+      const { error: me } = await supabase.from('media_files').insert({
+        b2_key: media.key, kind: media.kind || 'image', content_type: media.contentType,
+        original_name: media.originalName, size_bytes: media.sizeBytes || 0
+      });
+      if (me) return res.status(500).json({ ok: false, error: me.message });
+    }
+
     const { data: row, error } = await supabase.from(table).insert(data).select().single();
-    if (error) return res.status(500).json({ ok: false, error: error.message });
+    if (error) {
+      if (media && media.key) await removeFiles([media.key]);
+      return res.status(500).json({ ok: false, error: error.message });
+    }
     return res.status(200).json({ ok: true, row });
   }
 
