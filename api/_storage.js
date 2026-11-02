@@ -1,4 +1,5 @@
-const { S3Client } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const s3 = new S3Client({
   region: process.env.B2_REGION,
@@ -12,16 +13,18 @@ const s3 = new S3Client({
   responseChecksumValidation: 'WHEN_REQUIRED',
 });
 
-const { PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
-const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
-
 async function presignPut(bucket, key, contentType, expiresIn = 900) {
   const cmd = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType });
   return getSignedUrl(s3, cmd, { expiresIn });
 }
-async function presignGet(bucket, key, expiresIn = 3600) {
-  const cmd = new GetObjectCommand({ Bucket: bucket, Key: key });
-  return getSignedUrl(s3, cmd, { expiresIn });
+
+// Pass downloadName to make the link save the file instead of just showing it.
+async function presignGet(bucket, key, expiresIn = 3600, downloadName) {
+  const input = { Bucket: bucket, Key: key };
+  if (downloadName) {
+    input.ResponseContentDisposition = 'attachment; filename="' + String(downloadName).replace(/"/g, '') + '"';
+  }
+  return getSignedUrl(s3, new GetObjectCommand(input), { expiresIn });
 }
 
 module.exports = { s3, BUCKET: process.env.B2_BUCKET_NAME, presignPut, presignGet };

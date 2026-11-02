@@ -63,6 +63,7 @@ module.exports = `<!DOCTYPE html>
 const TABS = [['ministries','Ministries'],['events','Events'],['videos','Videos'],['albums','Photos'],['sermons','Sermons'],['leaders','Leadership']];
 let tab = 'events';
 let content = null;
+let openAlbum = null;   // the album being managed, or null
 
 function minOptions(){
   return (content.ministries||[]).filter(m=>m.id!=='home')
@@ -88,7 +89,8 @@ function formFor(t){
   if (t==='albums') return \`
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
     <div class="field"><label>Album title</label><input id="f_title" placeholder="Youth Camp 2026"></div>
-    <button class="btn" id="addBtn">Publish album</button>\`;
+    <div class="field"><label>Photos (you can choose many)</label><input type="file" id="album_files" accept="image/*" multiple><div style="font-size:12px;color:#857d91;margin-top:5px">Each photo is shrunk to under 0.8MB automatically. You can add more photos later from Manage.</div></div>
+    <button class="btn" id="addBtn">Create album</button>\`;
   if (t==='sermons') return \`
     <div class="field"><label>Title</label><input id="f_title" placeholder="The God Who Restores"></div>
     <div class="field"><label>Preacher</label><input id="f_preacher" placeholder="Rev. J. Mwenda"></div>
@@ -105,7 +107,10 @@ function formFor(t){
 function rowLabel(t, r){
   if (t==='events') return [r.title, (r.event_date||'')+' · '+(r.place||'')];
   if (t==='videos') return [r.title, r.description||''];
-  if (t==='albums') return [r.title, ''];
+  if (t==='albums') {
+    var n = (content.photos || []).filter(function(p){ return p.album_id === r.id; }).length;
+    return [r.title, n + (n === 1 ? ' photo' : ' photos')];
+  }
   if (t==='sermons') return [r.title, (r.preacher||'')+' · '+(r.sermon_date||'')];
   return [r.name, r.role||''];
 }
@@ -120,8 +125,9 @@ async function loadContent(){
 function render(){
   document.getElementById('tabs').innerHTML = TABS.map(([k,l]) =>
     '<button class="tab '+(k===tab?'on':'')+'" data-tab="'+k+'">'+l+'</button>').join('');
-  document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; render(); });
+  document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; openAlbum = null; render(); });
 
+  if (tab === 'albums' && openAlbum) { renderAlbumDetail(); return; }
   if (tab === 'ministries') { renderMinistries(); return; }
   document.getElementById('formPanel').style.display = '';
 
@@ -134,10 +140,12 @@ function render(){
   document.getElementById('listArea').innerHTML = rows.length ? rows.map(r => {
     const [title, sub] = rowLabel(tab, r);
     return '<div class="row"><span class="t"><b>'+title+'</b><span>'+sub+'</span></span>' +
+      (tab === 'albums' ? '<button class="btn" style="padding:6px 12px;font-size:12.5px" data-manage="'+r.id+'">Manage</button>' : '') +
       '<button class="del" data-id="'+r.id+'">✕</button></div>';
   }).join('') : '<div class="msg">Nothing published yet.</div>';
 
   document.querySelectorAll('[data-id]').forEach(b => b.onclick = () => deleteItem(b.dataset.id));
+  document.querySelectorAll('[data-manage]').forEach(b => b.onclick = () => { openAlbum = b.dataset.manage; render(); });
 }
 
 const MAX_PHOTO_BYTES = 800 * 1024;   // every photo is shrunk to under 0.8MB
@@ -199,6 +207,8 @@ async function addItem(){
   if (!data.title && !data.name) { alert('Please fill in the title/name field.'); return; }
   if (tab === 'events' && !data.event_date) { alert('Please choose the event date.'); return; }
 
+  if (tab === 'albums') { await createAlbum(btn, label, data); return; }
+
   const payload = { table: tab, data: data };
   btn.disabled = true;
   try {
@@ -234,13 +244,124 @@ async function addItem(){
 }
 
 async function deleteItem(id){
-  if (!confirm('Delete this?')) return;
+  if (!confirm(tab === 'albums' ? 'Delete this album and ALL its photos?' : 'Delete this?')) return;
   try {
     const r = await fetch('/api/admin?table=' + tab + '&id=' + encodeURIComponent(id), { method: 'DELETE' });
     const res = await r.json();
     if (!res.ok) { alert('Error: ' + res.error); return; }
     await loadContent();
   } catch (e) { alert('Could not reach the server.'); }
+}
+
+async function uploadPhotosToAlbum(albumId, files, progress){
+  var failed = [];
+  var done = 0;
+  for (var i = 0; i < files.length; i++) {
+    var file = files[i];
+    progress('Photo ' + (i + 1) + ' of ' + files.length + '…');
+    try {
+      if (!file.type.startsWith('image/')) throw new Error('not an image');
+      if (file.size > 30*1024*1024) throw new Error('failed: image file above 30mbs');
+      file = await shrinkPhoto(file);
+      var r1 = await fetch('/api/admin', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'get-upload-url', kind:'image', filename:file.name, contentType:file.type, sizeBytes:file.size })
+      });
+      var d1 = await r1.json();
+      if (!d1.ok) throw new Error(d1.error);
+      var r2 = await fetch(d1.uploadUrl, { method:'PUT', headers:{'Content-Type':file.type}, body:file });
+      if (!r2.ok) throw new Error('upload to storage failed');
+      var r3 = await fetch('/api/admin', {
+        method: 'POST', headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({ action:'add-photos', albumId:albumId, photos:[{ key:d1.key, contentType:file.type, sizeBytes:file.size, originalName:file.name }] })
+      });
+      var d3 = await r3.json();
+      if (!d3.ok) throw new Error(d3.error);
+      done++;
+    } catch (e) {
+      failed.push(files[i].name + ' (' + e.message + ')');
+    }
+  }
+  return { done: done, failed: failed };
+}
+
+function reportUpload(out, total){
+  if (out.failed.length) {
+    alert(out.done + ' of ' + total + ' photos were added. These failed: ' + out.failed.slice(0, 6).join(', '));
+  }
+}
+
+async function createAlbum(btn, label, data){
+  const fileInput = document.getElementById('album_files');
+  const files = fileInput ? Array.from(fileInput.files) : [];
+  btn.disabled = true;
+  try {
+    btn.textContent = 'Creating album…';
+    const r = await fetch('/api/admin', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ table: 'albums', data: data })
+    });
+    const res = await r.json();
+    if (!res.ok) { alert('Error: ' + res.error); btn.disabled = false; btn.textContent = label; return; }
+    if (files.length) {
+      const out = await uploadPhotosToAlbum(res.row.id, files, function(msg){ btn.textContent = msg; });
+      reportUpload(out, files.length);
+    }
+    await loadContent();
+  } catch (e) { alert('Could not reach the server.'); btn.disabled = false; btn.textContent = label; }
+}
+
+async function renderAlbumDetail(){
+  document.getElementById('formPanel').style.display = 'none';
+  const album = (content.albums || []).find(function(a){ return a.id === openAlbum; });
+  if (!album) { openAlbum = null; render(); return; }
+  const box = document.getElementById('listArea');
+  document.getElementById('listTitle').textContent = album.title;
+  box.innerHTML = '<div class="msg">Loading photos…</div>';
+  var photos = [];
+  try {
+    const r = await fetch('/api/content?album=' + encodeURIComponent(album.id));
+    const d = await r.json();
+    if (d.ok) photos = d.photos;
+  } catch (e) {}
+  if (openAlbum !== album.id) return;
+
+  var html = '<button class="tab" id="albumBack" style="margin-bottom:14px">‹ Back to albums</button>' +
+    '<div class="field"><label>Add more photos</label><input type="file" id="more_files" accept="image/*" multiple></div>' +
+    '<button class="btn" id="morePhotosBtn" style="margin-bottom:16px">Upload photos</button>' +
+    '<div style="font-size:12.5px;color:#857d91;margin-bottom:10px">' + photos.length + (photos.length === 1 ? ' photo' : ' photos') + ' in this album</div>';
+  if (photos.length) {
+    html += '<div style="display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(110px,1fr))">';
+    photos.forEach(function(p){
+      html += '<div style="position:relative;aspect-ratio:1;border-radius:8px;overflow:hidden;background:#eee">' +
+        '<img src="' + p.url + '" alt="" style="width:100%;height:100%;object-fit:cover;display:block">' +
+        '<button class="del" data-photo="' + p.id + '" title="Delete photo" style="position:absolute;top:5px;right:5px;width:26px;height:26px">✕</button></div>';
+    });
+    html += '</div>';
+  }
+  box.innerHTML = html;
+
+  document.getElementById('albumBack').onclick = function(){ openAlbum = null; render(); };
+  document.getElementById('morePhotosBtn').onclick = async function(){
+    const btn = document.getElementById('morePhotosBtn');
+    const files = Array.from(document.getElementById('more_files').files);
+    if (!files.length) { alert('Choose some photos first.'); return; }
+    btn.disabled = true;
+    const out = await uploadPhotosToAlbum(album.id, files, function(msg){ btn.textContent = msg; });
+    reportUpload(out, files.length);
+    await loadContent();
+  };
+  box.querySelectorAll('[data-photo]').forEach(function(b){
+    b.onclick = async function(){
+      if (!confirm('Delete this photo?')) return;
+      try {
+        const r = await fetch('/api/admin?action=delete-photo&id=' + encodeURIComponent(b.dataset.photo), { method: 'DELETE' });
+        const d = await r.json();
+        if (!d.ok) { alert('Error: ' + d.error); return; }
+        await loadContent();
+      } catch (e) { alert('Could not reach the server.'); }
+    };
+  });
 }
 
 function renderMinistries(){

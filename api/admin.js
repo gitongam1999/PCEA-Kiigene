@@ -9,6 +9,7 @@ const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
 
 // Which columns on each table hold a stored file's key.
 // When a row is deleted, its files are deleted too.
+// (Album photos live in their own table and are handled separately below.)
 const FILE_COLUMNS = {
   events: ['image_url'],
   videos: ['file_url', 'thumbnail_url'],
@@ -29,11 +30,13 @@ function safeKey(prefix, filename) {
 
 // Delete files from the bucket and stop counting them toward the storage limit.
 async function removeFiles(keys) {
-  for (const key of keys) {
-    if (!key) continue;
-    try { await s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key })); } catch (e) {}
-    await supabase.from('media_files').delete().eq('b2_key', key);
+  keys = (keys || []).filter(Boolean);
+  if (!keys.length) return;
+  for (let i = 0; i < keys.length; i += 10) {
+    await Promise.allSettled(keys.slice(i, i + 10).map(key =>
+      s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))));
   }
+  await supabase.from('media_files').delete().in('b2_key', keys);
 }
 
 // The Home page's cover photo lives on the church_info row.
@@ -62,13 +65,27 @@ module.exports = async (req, res) => {
       return res.status(200).json({ ok: true });
     }
 
+    if (action === 'delete-photo') {
+      if (!id) return res.status(400).json({ ok: false, error: 'Missing photo id.' });
+      const { data: ph } = await supabase.from('photos').select('file_url').eq('id', id).single();
+      const { error } = await supabase.from('photos').delete().eq('id', id);
+      if (error) return res.status(500).json({ ok: false, error: error.message });
+      if (ph && ph.file_url) await removeFiles([ph.file_url]);
+      return res.status(200).json({ ok: true });
+    }
+
     if (!ALLOWED.includes(table)) return res.status(400).json({ ok: false, error: 'Unknown table.' });
 
-    const cols = FILE_COLUMNS[table] || [];
     let keys = [];
-    if (cols.length) {
-      const { data: old } = await supabase.from(table).select(cols.join(',')).eq('id', id).single();
-      if (old) keys = cols.map(c => old[c]).filter(Boolean);
+    if (table === 'albums') {
+      const { data: ph } = await supabase.from('photos').select('file_url').eq('album_id', id);
+      keys = (ph || []).map(p => p.file_url).filter(Boolean);
+    } else {
+      const cols = FILE_COLUMNS[table] || [];
+      if (cols.length) {
+        const { data: old } = await supabase.from(table).select(cols.join(',')).eq('id', id).single();
+        if (old) keys = cols.map(c => old[c]).filter(Boolean);
+      }
     }
     const { error } = await supabase.from(table).delete().eq('id', id);
     if (error) return res.status(500).json({ ok: false, error: error.message });
@@ -119,6 +136,34 @@ module.exports = async (req, res) => {
       if (e2) return res.status(500).json({ ok: false, error: e2.message });
 
       return res.status(200).json({ ok: true });
+    }
+
+    // Put already-uploaded photos into an album.
+    if (body.action === 'add-photos') {
+      const { albumId, photos } = body;
+      if (!albumId || !Array.isArray(photos) || !photos.length) {
+        return res.status(400).json({ ok: false, error: 'Missing album or photos.' });
+      }
+      if (photos.length > 50) return res.status(400).json({ ok: false, error: 'Too many photos at once.' });
+      const keys = photos.map(p => p && p.key).filter(Boolean);
+      if (keys.length !== photos.length) return res.status(400).json({ ok: false, error: 'A photo is missing its key.' });
+
+      const { data: last } = await supabase.from('photos').select('sort_order')
+        .eq('album_id', albumId).order('sort_order', { ascending: false }).limit(1);
+      const next = ((last && last[0] && last[0].sort_order) || 0) + 1;
+
+      const { error: me } = await supabase.from('media_files').insert(photos.map(p => ({
+        b2_key: p.key, kind: 'image', content_type: p.contentType,
+        original_name: p.originalName, size_bytes: p.sizeBytes || 0
+      })));
+      if (me) { await removeFiles(keys); return res.status(500).json({ ok: false, error: me.message }); }
+
+      const { error: pe } = await supabase.from('photos').insert(photos.map((p, i) => ({
+        album_id: albumId, file_url: p.key, sort_order: next + i
+      })));
+      if (pe) { await removeFiles(keys); return res.status(500).json({ ok: false, error: pe.message }); }
+
+      return res.status(200).json({ ok: true, added: photos.length });
     }
 
     // Create a row (event, video, album, sermon, leader), optionally with one uploaded file.

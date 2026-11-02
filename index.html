@@ -329,6 +329,20 @@ footer .copy{width:100%;border-top:1px solid rgba(255,255,255,.14);margin-top:16
   #app[data-list="0"] .g-videos::-webkit-scrollbar-thumb,
   #app[data-list="0"] .g-photos::-webkit-scrollbar-thumb{background:#c9c9d3;border-radius:4px}
 }
+/* Photo albums */
+.g-album{display:grid;gap:8px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.album-photo{padding:0;border:0;background:var(--line);border-radius:10px;overflow:hidden;aspect-ratio:1;cursor:pointer;display:block}
+.album-photo img{width:100%;height:100%;object-fit:cover;display:block}
+#lightbox{position:fixed;inset:0;z-index:200;background:rgba(10,8,16,.95);display:none;align-items:center;justify-content:center}
+#lightbox.open{display:flex}
+#lightbox .lb-img{max-width:100%;max-height:calc(100% - 130px);object-fit:contain}
+#lightbox .lb-close,#lightbox .lb-nav{position:absolute;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.16);color:#fff;border:0;display:grid;place-items:center;cursor:pointer}
+#lightbox .lb-close{top:14px;right:14px}
+#lightbox .lb-nav{top:50%;transform:translateY(-50%)}
+#lightbox .lb-prev{left:10px}
+#lightbox .lb-next{right:10px}
+#lightbox .lb-dl{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);color:#fff;background:rgba(255,255,255,.18);padding:10px 20px;border-radius:22px;font-weight:600;font-size:14px;display:inline-flex;gap:8px;align-items:center}
+
 </style>
 </head>
 <body>
@@ -438,7 +452,7 @@ function adapt(api){
       len:fmtLen(v.length_seconds), desc:v.description||""
     })),
     albums:(api.albums||[]).map(a=>({
-      id:a.id, ministry:minName(a.ministry_id), title:a.title, count:albumCounts[a.id]||0
+      id:a.id, ministry:minName(a.ministry_id), title:a.title, count:albumCounts[a.id]||0, img:a.cover_url||null
     })),
     sermons:(api.sermons||[]).map(s=>({
       id:s.id, title:s.title, who:s.preacher||"", date:fmtDate(s.sermon_date), len:"" 
@@ -553,8 +567,8 @@ function videoCard(v,i){
       </div></div></article>`;
 }
 function albumCard(a,i){
-  return `<a class="card" href="#" data-toast="Opens the full ${a.title} album, with a download button on every photo.">
-    <div class="thumb sq">${ph(i+hashNum(String(a.id))+1)}<span class="count">${a.count} photos</span></div>
+  return `<a class="card" href="#/album/${a.id}">
+    <div class="thumb sq">${a.img?`<img src="${a.img}" alt="" loading="lazy" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">`:ph(i+hashNum(String(a.id))+1)}<span class="count">${a.count} photos</span></div>
     <div class="card-body" style="padding:11px 12px 13px;gap:3px">
       <h4 style="font-size:14px">${a.title}</h4>
       <div class="meta">${a.ministry}</div>
@@ -808,6 +822,7 @@ function render(){
   else if(route==='contact') html=pageContact();
   else if(['events','videos','photos','sermons'].includes(route)) html=listPage(route);
   else if(route==='search') html=pageSearch(decodeURIComponent((param||'q=').slice(2)));
+  else if(route.startsWith('album/')) html=pageAlbum(route.slice(6));
   else if(db.ministries.some(m=>m.id===route)) html=pageMinistry(route);
   else html=page404();
 
@@ -858,6 +873,99 @@ document.getElementById('searchInput').addEventListener('keydown',e=>{
     document.getElementById('searchBox').classList.remove('mobile-open');
   }
 });
+
+/* ---------- Photo albums: album page + full-screen viewer ---------- */
+let albumPhotos = [];
+let lbIndex = 0;
+
+function pageAlbum(id){
+  setTimeout(function(){ loadAlbum(id); }, 0);
+  return cover(5,"Photos","Photo album","")
+    + '<div class="wrap"><section><div id="albumBody"><div class="panel"><p>Loading photos…</p></div></div></section></div>';
+}
+
+async function loadAlbum(id){
+  const box = document.getElementById('albumBody');
+  if(!box) return;
+  try{
+    const r = await fetch('/api/content?album=' + encodeURIComponent(id));
+    const d = await r.json();
+    if(!d.ok) throw new Error(d.error || 'Could not load this album.');
+    if(document.getElementById('albumBody') !== box) return;   // visitor already moved on
+    albumPhotos = d.photos;
+    applyTheme(d.album.ministry_id);
+    const h = document.querySelector('.cover h1');
+    if(h) h.textContent = d.album.title;
+    box.innerHTML = albumPhotos.length
+      ? '<div class="g-album">' + albumPhotos.map(function(p,i){
+          return '<button class="album-photo" data-i="'+i+'" aria-label="Open photo '+(i+1)+'"><img src="'+p.url+'" alt="" loading="lazy"></button>';
+        }).join('') + '</div>'
+      : '<div class="panel"><p>No photos in this album yet.</p></div>';
+    box.querySelectorAll('.album-photo').forEach(function(b){
+      b.onclick = function(){ openLightbox(+b.dataset.i); };
+    });
+  }catch(err){
+    if(document.getElementById('albumBody') === box){
+      box.innerHTML = '<div class="panel"><p>'+err.message+'</p></div>';
+    }
+  }
+}
+
+function openLightbox(i){
+  lbIndex = i;
+  let lb = document.getElementById('lightbox');
+  if(!lb){
+    lb = document.createElement('div');
+    lb.id = 'lightbox';
+    lb.innerHTML =
+      '<button class="lb-close" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' +
+      '<button class="lb-nav lb-prev" aria-label="Previous photo"><svg class="icon" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>' +
+      '<img class="lb-img" alt="">' +
+      '<button class="lb-nav lb-next" aria-label="Next photo"><svg class="icon" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg></button>' +
+      '<a class="lb-dl" href="#">' + dlIcon + ' Download</a>';
+    document.body.appendChild(lb);
+    lb.querySelector('.lb-close').onclick = closeLightbox;
+    lb.querySelector('.lb-prev').onclick = function(e){ e.stopPropagation(); stepLightbox(-1); };
+    lb.querySelector('.lb-next').onclick = function(e){ e.stopPropagation(); stepLightbox(1); };
+    lb.addEventListener('click', function(e){ if(e.target === lb) closeLightbox(); });
+    let startX = null;
+    lb.addEventListener('touchstart', function(e){ startX = e.touches[0].clientX; }, {passive:true});
+    lb.addEventListener('touchend', function(e){
+      if(startX === null) return;
+      const dx = e.changedTouches[0].clientX - startX;
+      startX = null;
+      if(Math.abs(dx) > 50) stepLightbox(dx < 0 ? 1 : -1);
+    });
+  }
+  lb.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  showLightbox();
+}
+function showLightbox(){
+  const p = albumPhotos[lbIndex];
+  const lb = document.getElementById('lightbox');
+  if(!p || !lb) return;
+  lb.querySelector('.lb-img').src = p.url;
+  lb.querySelector('.lb-dl').href = p.download;
+}
+function stepLightbox(d){
+  if(!albumPhotos.length) return;
+  lbIndex = (lbIndex + d + albumPhotos.length) % albumPhotos.length;
+  showLightbox();
+}
+function closeLightbox(){
+  const lb = document.getElementById('lightbox');
+  if(lb) lb.classList.remove('open');
+  document.body.style.overflow = '';
+}
+document.addEventListener('keydown', function(e){
+  const lb = document.getElementById('lightbox');
+  if(!lb || !lb.classList.contains('open')) return;
+  if(e.key === 'Escape') closeLightbox();
+  else if(e.key === 'ArrowRight') stepLightbox(1);
+  else if(e.key === 'ArrowLeft') stepLightbox(-1);
+});
+window.addEventListener('hashchange', closeLightbox);
 
 window.addEventListener('hashchange',()=>{window.scrollTo(0,0);render();});
 boot();
