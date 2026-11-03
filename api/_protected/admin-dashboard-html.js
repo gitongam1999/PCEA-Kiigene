@@ -84,7 +84,9 @@ function formFor(t){
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
     <div class="field"><label>Title</label><input id="f_title" placeholder="Men's Fellowship Gathering"></div>
     <div class="field"><label>Description</label><textarea id="f_description" rows="2"></textarea></div>
-    <div class="field"><label style="color:#857d91">Video file upload comes in a later step — not yet.</label></div>
+    <div class="field"><label>Video file</label><input type="file" id="video_file" accept="video/*"><div style="font-size:12px;color:#857d91;margin-top:5px">MP4 (H.264) works best. Up to 720p; anything sharper is refused. Large videos upload in chunks automatically. Keep this page open until it finishes.</div></div>
+    <div class="field"><label>Thumbnail (optional)</label><input type="file" id="thumb_file" accept="image/*"><div style="font-size:12px;color:#857d91;margin-top:5px">16:9 works best. If you skip this, a picture is taken from the video automatically.</div></div>
+    <div id="vprog" style="display:none;margin-bottom:12px"><div style="height:8px;background:#e4e1e9;border-radius:4px;overflow:hidden"><div id="vbar" style="height:100%;width:0;background:var(--accent)"></div></div><div id="vtxt" style="font-size:12.5px;color:#857d91;margin-top:5px"></div></div>
     <button class="btn" id="addBtn">Publish video</button>\`;
   if (t==='albums') return \`
     <div class="field"><label>Ministry</label><select id="f_ministry_id">\${minOptions()}</select></div>
@@ -106,7 +108,12 @@ function formFor(t){
 
 function rowLabel(t, r){
   if (t==='events') return [r.title, (r.event_date||'')+' · '+(r.place||'')];
-  if (t==='videos') return [r.title, r.description||''];
+  if (t==='videos') {
+    var bits = [];
+    if (r.length_seconds) bits.push(fmtDuration(r.length_seconds));
+    if (r.description) bits.push(r.description);
+    return [r.title, bits.join(' · ')];
+  }
   if (t==='albums') {
     var n = (content.photos || []).filter(function(p){ return p.album_id === r.id; }).length;
     return [r.title, n + (n === 1 ? ' photo' : ' photos')];
@@ -208,6 +215,7 @@ async function addItem(){
   if (tab === 'events' && !data.event_date) { alert('Please choose the event date.'); return; }
 
   if (tab === 'albums') { await createAlbum(btn, label, data); return; }
+  if (tab === 'videos') { await publishVideo(btn, label, data); return; }
 
   const payload = { table: tab, data: data };
   btn.disabled = true;
@@ -251,6 +259,200 @@ async function deleteItem(id){
     if (!res.ok) { alert('Error: ' + res.error); return; }
     await loadContent();
   } catch (e) { alert('Could not reach the server.'); }
+}
+
+const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos are uploaded in chunks
+const CHUNK_MAX = 450 * 1024 * 1024;          // no chunk is bigger than this
+const MAX_VIDEO_SIDE = 720;                   // "720p": the shorter side of the picture may not be bigger
+let uploadBusy = false;
+window.addEventListener('beforeunload', function(e){
+  if (uploadBusy) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// Split a big file into equal chunks, none bigger than 450MB.
+function planChunks(size){
+  if (size <= VIDEO_SINGLE_MAX) return [{ start: 0, end: size }];
+  var n = Math.ceil(size / CHUNK_MAX);
+  var each = Math.ceil(size / n);
+  var parts = [];
+  for (var i = 0; i < n; i++) parts.push({ start: i * each, end: Math.min(size, (i + 1) * each) });
+  return parts;
+}
+
+function fmtDuration(sec){
+  sec = Math.round(sec || 0);
+  var m = Math.floor(sec / 60);
+  var s = sec % 60;
+  return m + ':' + (s < 10 ? '0' : '') + s;
+}
+
+// Ask the browser for the video's size and length (this also proves the browser can play it).
+function readVideoInfo(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file);
+    var v = document.createElement('video');
+    v.preload = 'metadata';
+    v.muted = true;
+    v.playsInline = true;
+    var timer = setTimeout(function(){ cleanup(); reject(new Error('timeout')); }, 20000);
+    function cleanup(){ clearTimeout(timer); URL.revokeObjectURL(url); }
+    v.onloadedmetadata = function(){
+      if (!v.videoWidth || !v.videoHeight) { cleanup(); reject(new Error('no picture')); return; }
+      resolve({ width: v.videoWidth, height: v.videoHeight, duration: v.duration, video: v, cleanup: cleanup });
+    };
+    v.onerror = function(){ cleanup(); reject(new Error('unreadable')); };
+    v.src = url;
+  });
+}
+
+// Take a picture from the video (about 2 seconds in) to use as the thumbnail.
+function grabFrame(v, info){
+  return new Promise(function(resolve){
+    var timer = setTimeout(function(){ resolve(null); }, 8000);
+    v.onseeked = function(){
+      clearTimeout(timer);
+      try {
+        var scale = Math.min(1, 1280 / Math.max(info.width, info.height));
+        var c = document.createElement('canvas');
+        c.width = Math.round(info.width * scale);
+        c.height = Math.round(info.height * scale);
+        c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+        c.toBlob(function(b){ resolve(b ? new File([b], 'thumbnail.jpg', { type: 'image/jpeg' }) : null); }, 'image/jpeg', 0.85);
+      } catch (e) { resolve(null); }
+    };
+    var t = isFinite(info.duration) ? Math.min(2, info.duration / 2) : 1;
+    v.currentTime = Math.max(0.1, t);
+  });
+}
+
+function adminPost(body){
+  return fetch('/api/admin', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) })
+    .then(function(r){ return r.json(); })
+    .then(function(d){ if (!d.ok) throw new Error(d.error || 'Something went wrong.'); return d; });
+}
+
+// Send one file (or one chunk) to storage, reporting progress as it goes.
+function putBlob(url, blob, contentType, onProgress){
+  return new Promise(function(resolve, reject){
+    var xhr = new XMLHttpRequest();
+    xhr.open('PUT', url);
+    if (contentType) xhr.setRequestHeader('Content-Type', contentType);
+    xhr.upload.onprogress = function(e){ if (e.lengthComputable) onProgress(e.loaded); };
+    xhr.onload = function(){
+      if (xhr.status >= 200 && xhr.status < 300) resolve();
+      else reject(new Error('storage answered ' + xhr.status));
+    };
+    xhr.onerror = function(){ reject(new Error('network problem')); };
+    xhr.send(blob);
+  });
+}
+
+// If a chunk fails (bad signal), try that chunk again, up to 3 times.
+async function putWithRetry(url, blob, contentType, tries, onProgress){
+  var lastErr = null;
+  for (var attempt = 1; attempt <= tries; attempt++) {
+    try { await putBlob(url, blob, contentType, onProgress); return; }
+    catch (e) {
+      lastErr = e;
+      onProgress(0);
+      if (attempt < tries) await new Promise(function(r){ setTimeout(r, 1000 * attempt); });
+    }
+  }
+  throw lastErr;
+}
+
+async function publishVideo(btn, label, data){
+  const fileInput = document.getElementById('video_file');
+  const thumbInput = document.getElementById('thumb_file');
+  const box = document.getElementById('vprog');
+  const bar = document.getElementById('vbar');
+  const txt = document.getElementById('vtxt');
+  const file = fileInput && fileInput.files[0];
+  if (!file) { alert('Please choose the video file.'); return; }
+  if (!file.type.startsWith('video/')) { alert('Please choose a video file.'); return; }
+
+  var info = null;
+  var started = null;   // set once a chunked upload has begun, so it can be cancelled if something fails
+  function stop(){
+    uploadBusy = false;
+    btn.disabled = false;
+    btn.textContent = label;
+    box.style.display = 'none';
+    bar.style.width = '0';
+    if (info && info.cleanup) info.cleanup();
+  }
+  uploadBusy = true;
+  btn.disabled = true;
+  try {
+    btn.textContent = 'Checking video…';
+    try { info = await readVideoInfo(file); }
+    catch (e) { alert('This video could not be read by your browser. Please use an MP4 (H.264) video.'); stop(); return; }
+    if (Math.min(info.width, info.height) > MAX_VIDEO_SIDE) { alert('failed: video size above 720p'); stop(); return; }
+
+    // the thumbnail: the one you picked, or a picture taken from the video
+    var thumbFile = thumbInput && thumbInput.files[0];
+    if (thumbFile) {
+      if (!thumbFile.type.startsWith('image/') || thumbFile.size > 30*1024*1024) {
+        alert('The thumbnail must be an image under 30MB.'); stop(); return;
+      }
+    } else {
+      btn.textContent = 'Making thumbnail…';
+      thumbFile = await grabFrame(info.video, info);
+    }
+    var thumbMeta = null;
+    if (thumbFile) {
+      try { thumbFile = await shrinkPhoto(thumbFile); } catch (e) { thumbFile = null; }
+    }
+    if (thumbFile) {
+      btn.textContent = 'Uploading thumbnail…';
+      var t = await adminPost({ action:'get-upload-url', kind:'thumbnail', filename:thumbFile.name, contentType:thumbFile.type, sizeBytes:thumbFile.size });
+      await putWithRetry(t.uploadUrl, thumbFile, thumbFile.type, 2, function(){});
+      thumbMeta = { key:t.key, contentType:thumbFile.type, sizeBytes:thumbFile.size, originalName:thumbFile.name };
+    }
+
+    // the video itself
+    box.style.display = 'block';
+    var sent = 0;
+    function show(loadedNow){
+      var pct = Math.min(100, Math.round(((sent + loadedNow) / file.size) * 100));
+      bar.style.width = pct + '%';
+      txt.textContent = 'Uploading video… ' + pct + '%';
+      btn.textContent = pct + '%';
+    }
+    show(0);
+    var parts = planChunks(file.size);
+    var key = null;
+    var uploadId = null;
+    if (parts.length === 1) {
+      var one = await adminPost({ action:'get-upload-url', kind:'video', filename:file.name, contentType:file.type, sizeBytes:file.size });
+      key = one.key;
+      await putWithRetry(one.uploadUrl, file, file.type, 3, show);
+    } else {
+      var s = await adminPost({ action:'video-start', filename:file.name, contentType:file.type, sizeBytes:file.size, partCount:parts.length });
+      key = s.key; uploadId = s.uploadId;
+      started = { key: key, uploadId: uploadId };
+      for (var i = 0; i < parts.length; i++) {
+        await putWithRetry(s.partUrls[i], file.slice(parts[i].start, parts[i].end), null, 3, show);
+        sent += parts[i].end - parts[i].start;
+      }
+    }
+    sent = file.size;
+    show(0);
+    btn.textContent = 'Finishing…';
+    txt.textContent = 'Finishing…';
+    await adminPost({
+      action: 'finish-video', key: key, uploadId: uploadId, contentType: file.type, originalName: file.name,
+      data: { ministry_id: data.ministry_id, title: data.title, description: data.description,
+              length_seconds: isFinite(info.duration) ? Math.round(info.duration) : null },
+      thumbnail: thumbMeta
+    });
+    stop();
+    await loadContent();
+  } catch (e) {
+    if (started) { try { await adminPost({ action:'video-abort', key:started.key, uploadId:started.uploadId }); } catch (e2) {} }
+    alert('The video could not be uploaded: ' + e.message);
+    stop();
+  }
 }
 
 async function uploadPhotosToAlbum(albumId, files, progress){

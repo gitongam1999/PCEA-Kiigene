@@ -1,11 +1,16 @@
 const supabase = require('./_db');
 const { isAdmin } = require('./_session');
-const { s3, BUCKET, presignPut } = require('./_storage');
-const { DeleteObjectCommand } = require('@aws-sdk/client-s3');
+const { s3, BUCKET, presignPut, presignUploadPart } = require('./_storage');
+const {
+  DeleteObjectCommand, CreateMultipartUploadCommand, CompleteMultipartUploadCommand,
+  ListPartsCommand, AbortMultipartUploadCommand, ListMultipartUploadsCommand, HeadObjectCommand
+} = require('@aws-sdk/client-s3');
 
 const ALLOWED = ['events', 'videos', 'albums', 'sermons', 'leaders'];
 const STORAGE_CAP_BYTES = 9.5 * 1024 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
+const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos must be uploaded in chunks
+const VIDEO_MAX_PARTS = 40;
 
 // Which columns on each table hold a stored file's key.
 // When a row is deleted, its files are deleted too.
@@ -37,6 +42,20 @@ async function removeFiles(keys) {
       s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))));
   }
   await supabase.from('media_files').delete().in('b2_key', keys);
+}
+
+// Big uploads that were started but never finished still use up storage.
+// Whenever a new big upload starts, clear out any that are more than a day old.
+async function abortStaleUploads() {
+  try {
+    const out = await s3.send(new ListMultipartUploadsCommand({ Bucket: BUCKET }));
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const u of (out.Uploads || [])) {
+      if (u.Initiated && new Date(u.Initiated).getTime() < cutoff) {
+        try { await s3.send(new AbortMultipartUploadCommand({ Bucket: BUCKET, Key: u.Key, UploadId: u.UploadId })); } catch (e) {}
+      }
+    }
+  } catch (e) {}
 }
 
 // The Home page's cover photo lives on the church_info row.
@@ -101,10 +120,15 @@ module.exports = async (req, res) => {
 
     if (body.action === 'get-upload-url') {
       const { kind, filename, contentType, sizeBytes } = body;
-      if (!['image', 'cover', 'thumbnail'].includes(kind)) {
+      if (!['image', 'cover', 'thumbnail', 'video'].includes(kind)) {
         return res.status(400).json({ ok: false, error: 'This upload type is not supported yet.' });
       }
-      if (sizeBytes > IMAGE_MAX_BYTES) {
+      if (!(sizeBytes > 0)) return res.status(400).json({ ok: false, error: 'Missing file size.' });
+      if (kind === 'video') {
+        if (sizeBytes > VIDEO_SINGLE_MAX) {
+          return res.status(400).json({ ok: false, error: 'Videos over 500MB must be uploaded in chunks.' });
+        }
+      } else if (sizeBytes > IMAGE_MAX_BYTES) {
         return res.status(400).json({ ok: false, error: 'failed: image file above 30mbs' });
       }
       let used;
@@ -136,6 +160,107 @@ module.exports = async (req, res) => {
       if (e2) return res.status(500).json({ ok: false, error: e2.message });
 
       return res.status(200).json({ ok: true });
+    }
+
+    // Start a big (chunked) video upload. Returns one signed link per chunk.
+    if (body.action === 'video-start') {
+      const { filename, contentType, sizeBytes, partCount } = body;
+      if (!(sizeBytes > VIDEO_SINGLE_MAX)) {
+        return res.status(400).json({ ok: false, error: 'Videos up to 500MB use the normal upload.' });
+      }
+      if (!(partCount >= 2 && partCount <= VIDEO_MAX_PARTS)) {
+        return res.status(400).json({ ok: false, error: 'Bad number of chunks.' });
+      }
+      let used;
+      try { used = await storageUsed(); } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+      if (used + sizeBytes > STORAGE_CAP_BYTES) {
+        return res.status(400).json({ ok: false, error: 'Storage limit reached. Delete something before uploading more.' });
+      }
+      await abortStaleUploads();
+      const key = safeKey('video', filename);
+      try {
+        const created = await s3.send(new CreateMultipartUploadCommand({
+          Bucket: BUCKET, Key: key, ContentType: contentType || 'video/mp4'
+        }));
+        const uploadId = created.UploadId;
+        const partUrls = [];
+        for (let i = 1; i <= partCount; i++) partUrls.push(await presignUploadPart(BUCKET, key, uploadId, i));
+        return res.status(200).json({ ok: true, key, uploadId, partUrls });
+      } catch (e) {
+        return res.status(500).json({ ok: false, error: 'Could not start the upload: ' + e.message });
+      }
+    }
+
+    // Give up on a chunked upload (so its pieces don't use up storage).
+    if (body.action === 'video-abort') {
+      const { key, uploadId } = body;
+      if (!key || !String(key).startsWith('video/') || !uploadId) {
+        return res.status(400).json({ ok: false, error: 'Missing upload details.' });
+      }
+      try { await s3.send(new AbortMultipartUploadCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId })); } catch (e) {}
+      return res.status(200).json({ ok: true });
+    }
+
+    // The video is fully uploaded: join the chunks (if any), check it, save it, and count its size.
+    if (body.action === 'finish-video') {
+      const { key, uploadId, contentType, originalName, thumbnail } = body;
+      const d = body.data || {};
+      if (!key || !String(key).startsWith('video/')) return res.status(400).json({ ok: false, error: 'Missing video.' });
+      if (!d.title) return res.status(400).json({ ok: false, error: 'Please give the video a title.' });
+      if (thumbnail && thumbnail.key && !String(thumbnail.key).startsWith('thumbnail/')) {
+        return res.status(400).json({ ok: false, error: 'Bad thumbnail.' });
+      }
+      const thumbKey = thumbnail && thumbnail.key ? thumbnail.key : null;
+
+      let size = 0;
+      try {
+        if (uploadId) {
+          const parts = [];
+          let marker;
+          do {
+            const out = await s3.send(new ListPartsCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId, PartNumberMarker: marker }));
+            (out.Parts || []).forEach(p => parts.push({ ETag: p.ETag, PartNumber: p.PartNumber }));
+            marker = out.IsTruncated ? out.NextPartNumberMarker : undefined;
+          } while (marker);
+          parts.sort((x, y) => x.PartNumber - y.PartNumber);
+          if (parts.length < 2) throw new Error('the upload is incomplete');
+          await s3.send(new CompleteMultipartUploadCommand({
+            Bucket: BUCKET, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts }
+          }));
+        }
+        const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+        size = head.ContentLength || 0;
+      } catch (e) {
+        return res.status(500).json({ ok: false, error: 'Could not finish the upload: ' + e.message });
+      }
+
+      const keys = [key].concat(thumbKey ? [thumbKey] : []);
+      let used;
+      try { used = await storageUsed(); } catch (e) { await removeFiles(keys); return res.status(500).json({ ok: false, error: e.message }); }
+      if (used + size > STORAGE_CAP_BYTES) {
+        await removeFiles(keys);
+        return res.status(400).json({ ok: false, error: 'Storage limit reached. Delete something before uploading more.' });
+      }
+
+      const mediaRows = [{ b2_key: key, kind: 'video', content_type: contentType, original_name: originalName, size_bytes: size }];
+      if (thumbKey) {
+        mediaRows.push({ b2_key: thumbKey, kind: 'thumbnail', content_type: thumbnail.contentType,
+          original_name: thumbnail.originalName, size_bytes: thumbnail.sizeBytes || 0 });
+      }
+      const { error: me } = await supabase.from('media_files').insert(mediaRows);
+      if (me) { await removeFiles(keys); return res.status(500).json({ ok: false, error: me.message }); }
+
+      const secs = Number(d.length_seconds);
+      const { data: created, error } = await supabase.from('videos').insert({
+        ministry_id: d.ministry_id || null,
+        title: d.title,
+        description: d.description || null,
+        length_seconds: d.length_seconds != null && d.length_seconds !== '' && isFinite(secs) ? Math.round(secs) : null,
+        file_url: key,
+        thumbnail_url: thumbKey
+      }).select().single();
+      if (error) { await removeFiles(keys); return res.status(500).json({ ok: false, error: error.message }); }
+      return res.status(200).json({ ok: true, row: created });
     }
 
     // Put already-uploaded photos into an album.
