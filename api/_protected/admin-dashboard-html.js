@@ -261,8 +261,8 @@ async function deleteItem(id){
   } catch (e) { alert('Could not reach the server.'); }
 }
 
-const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos are uploaded in chunks
-const CHUNK_MAX = 450 * 1024 * 1024;          // no chunk is bigger than this
+const VIDEO_SINGLE_MAX = 20 * 1024 * 1024;   // TEMPORARY TEST
+const CHUNK_MAX = 10 * 1024 * 1024;   // TEMPORARY TEST
 const MAX_VIDEO_SIDE = 720;                   // "720p": the shorter side of the picture may not be bigger
 let uploadBusy = false;
 window.addEventListener('beforeunload', function(e){
