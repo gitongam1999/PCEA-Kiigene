@@ -9,7 +9,7 @@ const {
 const ALLOWED = ['events', 'videos', 'albums', 'sermons', 'leaders'];
 const STORAGE_CAP_BYTES = 9.5 * 1024 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
-const VIDEO_SINGLE_MAX = 20 * 1024 * 1024;   // TEMPORARY TEST
+const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos must be uploaded in chunks
 const VIDEO_MAX_PARTS = 40;
 
 // Which columns on each table hold a stored file's key.
