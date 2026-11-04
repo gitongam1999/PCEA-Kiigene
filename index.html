@@ -343,6 +343,17 @@ footer .copy{width:100%;border-top:1px solid rgba(255,255,255,.14);margin-top:16
 #lightbox .lb-next{right:10px}
 #lightbox .lb-dl{position:absolute;bottom:24px;left:50%;transform:translateX(-50%);color:#fff;background:rgba(255,255,255,.18);padding:10px 20px;border-radius:22px;font-weight:600;font-size:14px;display:inline-flex;gap:8px;align-items:center}
 
+/* Video player */
+#vplayer{position:fixed;inset:0;z-index:210;background:rgba(10,8,16,.96);display:none;align-items:center;justify-content:center;padding:56px 12px 20px}
+#vplayer.open{display:flex}
+#vplayer .vp-inner{width:100%;max-width:960px}
+#vplayer .vp-video{width:100%;max-height:calc(100vh - 170px);max-height:calc(100dvh - 170px);background:#000;border-radius:10px;display:block}
+#vplayer .vp-msg{display:none;color:#fff;background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;margin-top:10px;font-size:14px}
+#vplayer .vp-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:12px;color:#fff}
+#vplayer .vp-title{font-weight:600;font-size:15px;min-width:0}
+#vplayer .vp-dl{flex:none;color:#fff;background:rgba(255,255,255,.18);padding:9px 16px;border-radius:20px;font-weight:600;font-size:13.5px;display:inline-flex;gap:8px;align-items:center}
+#vplayer .vp-close{position:absolute;top:10px;right:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.16);color:#fff;border:0;display:grid;place-items:center;cursor:pointer}
+
 </style>
 </head>
 <body>
@@ -449,7 +460,7 @@ function adapt(api){
     }),
     videos:(api.videos||[]).map(v=>({
       id:v.id, ministry:minName(v.ministry_id), title:v.title,
-      len:fmtLen(v.length_seconds), desc:v.description||""
+      len:fmtLen(v.length_seconds), desc:v.description||"", img:v.thumb||null, ok:!!v.has_file
     })),
     albums:(api.albums||[]).map(a=>({
       id:a.id, ministry:minName(a.ministry_id), title:a.title, count:albumCounts[a.id]||0, img:a.cover_url||null
@@ -557,13 +568,13 @@ function eventCard(e,i){
 }
 function videoCard(v,i){
   return `<article class="card">
-    <div class="thumb">${ph(i+hashNum(String(v.id))+3)}<span class="chip">${v.ministry}</span>
+    <div class="thumb">${v.img?`<img src="${v.img}" alt="" loading="lazy" style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover">`:ph(i+hashNum(String(v.id))+3)}<span class="chip">${v.ministry}</span>
       <span class="count">${v.len}</span>
-      <div class="play"><span><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span></div></div>
+      ${v.ok?`<div class="play" data-watch="${v.id}"><span><svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg></span></div>`:''}</div>
     <div class="card-body"><h4>${v.title}</h4><p>${v.desc||''}</p>
       <div class="card-foot">
-        <a class="link" href="#" data-toast="The video player opens here once videos are uploaded.">Watch ${arrow}</a>
-        <a class="link muted" href="#" data-toast="Download starts here once the real file is uploaded to storage.">${dlIcon} Download</a>
+        ${v.ok?`<a class="link" href="#" data-watch="${v.id}">Watch ${arrow}</a>`:`<span class="meta">Video coming soon</span>`}
+        ${v.ok?`<a class="link muted" href="#" data-dl-video="${v.id}">${dlIcon} Download</a>`:'' }
       </div></div></article>`;
 }
 function albumCard(a,i){
@@ -966,6 +977,86 @@ document.addEventListener('keydown', function(e){
   else if(e.key === 'ArrowLeft') stepLightbox(-1);
 });
 window.addEventListener('hashchange', closeLightbox);
+
+/* ---------- Videos: full-screen player + download ---------- */
+async function fetchVideo(id){
+  const r = await fetch('/api/content?video=' + encodeURIComponent(id));
+  const d = await r.json();
+  if(!d.ok) throw new Error(d.error || 'Could not load this video.');
+  return d.video;
+}
+
+async function openVideo(id){
+  let box = document.getElementById('vplayer');
+  if(!box){
+    box = document.createElement('div');
+    box.id = 'vplayer';
+    box.innerHTML =
+      '<button class="vp-close" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' +
+      '<div class="vp-inner">' +
+        '<video class="vp-video" controls playsinline preload="metadata"></video>' +
+        '<div class="vp-msg"></div>' +
+        '<div class="vp-bar"><div class="vp-title"></div><a class="vp-dl" href="#">' + dlIcon + ' Download</a></div>' +
+      '</div>';
+    document.body.appendChild(box);
+    box.querySelector('.vp-close').onclick = closeVideo;
+    box.addEventListener('click', function(e){ if(e.target === box) closeVideo(); });
+    box.querySelector('.vp-video').addEventListener('error', function(){
+      if(!this.getAttribute('src')) return;
+      const m = box.querySelector('.vp-msg');
+      m.textContent = 'This video could not be played. Please refresh the page and try again.';
+      m.style.display = 'block';
+    });
+  }
+  const vid = box.querySelector('.vp-video');
+  const msg = box.querySelector('.vp-msg');
+  const card = db.videos.find(function(x){ return String(x.id) === String(id); });
+  box.querySelector('.vp-title').textContent = card ? card.title : '';
+  msg.style.display = 'none';
+  vid.removeAttribute('src');
+  vid.poster = (card && card.img) || '';
+  box.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  try{
+    const v = await fetchVideo(id);
+    if(!box.classList.contains('open')) return;          // closed while loading
+    if(v.poster) vid.poster = v.poster;
+    vid.src = v.src;
+    box.querySelector('.vp-dl').href = v.download;
+    const p = vid.play();
+    if(p && p.catch) p.catch(function(){});
+  }catch(err){
+    msg.textContent = err.message;
+    msg.style.display = 'block';
+  }
+}
+
+function closeVideo(){
+  const box = document.getElementById('vplayer');
+  if(!box) return;
+  const vid = box.querySelector('.vp-video');
+  vid.pause();
+  vid.removeAttribute('src');
+  vid.load();
+  box.classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+document.addEventListener('click', async function(e){
+  const w = e.target.closest('[data-watch]');
+  if(w){ e.preventDefault(); openVideo(w.dataset.watch); return; }
+  const d = e.target.closest('[data-dl-video]');
+  if(d){
+    e.preventDefault();
+    toast('Preparing your download…');
+    try{
+      const v = await fetchVideo(d.dataset.dlVideo);
+      window.location.href = v.download;
+    }catch(err){ toast(err.message); }
+  }
+});
+document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeVideo(); });
+window.addEventListener('hashchange', closeVideo);
 
 window.addEventListener('hashchange',()=>{window.scrollTo(0,0);render();});
 boot();
