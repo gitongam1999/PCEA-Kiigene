@@ -11,6 +11,7 @@ const STORAGE_CAP_BYTES = 9.5 * 1024 * 1024 * 1024;
 const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
 const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos must be uploaded in chunks
 const VIDEO_MAX_PARTS = 40;
+const AUDIO_MAX = 500 * 1024 * 1024;           // audio is always uploaded in one piece
 
 // Which columns on each table hold a stored file's key.
 // When a row is deleted, its files are deleted too.
@@ -42,6 +43,26 @@ async function removeFiles(keys) {
       s3.send(new DeleteObjectCommand({ Bucket: BUCKET, Key: key }))));
   }
   await supabase.from('media_files').delete().in('b2_key', keys);
+}
+
+// An upload is done: join the chunks (if it was chunked) and read the file's real size from the bucket.
+async function finishFile(key, uploadId) {
+  if (uploadId) {
+    const parts = [];
+    let marker;
+    do {
+      const out = await s3.send(new ListPartsCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId, PartNumberMarker: marker }));
+      (out.Parts || []).forEach(p => parts.push({ ETag: p.ETag, PartNumber: p.PartNumber }));
+      marker = out.IsTruncated ? out.NextPartNumberMarker : undefined;
+    } while (marker);
+    parts.sort((x, y) => x.PartNumber - y.PartNumber);
+    if (parts.length < 2) throw new Error('the upload is incomplete');
+    await s3.send(new CompleteMultipartUploadCommand({
+      Bucket: BUCKET, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts }
+    }));
+  }
+  const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+  return head.ContentLength || 0;
 }
 
 // Big uploads that were started but never finished still use up storage.
@@ -120,13 +141,17 @@ module.exports = async (req, res) => {
 
     if (body.action === 'get-upload-url') {
       const { kind, filename, contentType, sizeBytes } = body;
-      if (!['image', 'cover', 'thumbnail', 'video'].includes(kind)) {
+      if (!['image', 'cover', 'thumbnail', 'video', 'audio'].includes(kind)) {
         return res.status(400).json({ ok: false, error: 'This upload type is not supported yet.' });
       }
       if (!(sizeBytes > 0)) return res.status(400).json({ ok: false, error: 'Missing file size.' });
       if (kind === 'video') {
         if (sizeBytes > VIDEO_SINGLE_MAX) {
           return res.status(400).json({ ok: false, error: 'Videos over 500MB must be uploaded in chunks.' });
+        }
+      } else if (kind === 'audio') {
+        if (sizeBytes > AUDIO_MAX) {
+          return res.status(400).json({ ok: false, error: 'failed: audio file above 500mbs' });
         }
       } else if (sizeBytes > IMAGE_MAX_BYTES) {
         return res.status(400).json({ ok: false, error: 'failed: image file above 30mbs' });
@@ -213,26 +238,8 @@ module.exports = async (req, res) => {
       const thumbKey = thumbnail && thumbnail.key ? thumbnail.key : null;
 
       let size = 0;
-      try {
-        if (uploadId) {
-          const parts = [];
-          let marker;
-          do {
-            const out = await s3.send(new ListPartsCommand({ Bucket: BUCKET, Key: key, UploadId: uploadId, PartNumberMarker: marker }));
-            (out.Parts || []).forEach(p => parts.push({ ETag: p.ETag, PartNumber: p.PartNumber }));
-            marker = out.IsTruncated ? out.NextPartNumberMarker : undefined;
-          } while (marker);
-          parts.sort((x, y) => x.PartNumber - y.PartNumber);
-          if (parts.length < 2) throw new Error('the upload is incomplete');
-          await s3.send(new CompleteMultipartUploadCommand({
-            Bucket: BUCKET, Key: key, UploadId: uploadId, MultipartUpload: { Parts: parts }
-          }));
-        }
-        const head = await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
-        size = head.ContentLength || 0;
-      } catch (e) {
-        return res.status(500).json({ ok: false, error: 'Could not finish the upload: ' + e.message });
-      }
+      try { size = await finishFile(key, uploadId); }
+      catch (e) { return res.status(500).json({ ok: false, error: 'Could not finish the upload: ' + e.message }); }
 
       const keys = [key].concat(thumbKey ? [thumbKey] : []);
       let used;
@@ -261,6 +268,65 @@ module.exports = async (req, res) => {
       }).select().single();
       if (error) { await removeFiles(keys); return res.status(500).json({ ok: false, error: error.message }); }
       return res.status(200).json({ ok: true, row: created });
+    }
+
+    // A sermon is fully uploaded (audio, video, or both): join chunks, check, save, and count the sizes.
+    if (body.action === 'finish-sermon') {
+      const d = body.data || {};
+      const audio = body.audio || null;
+      const video = body.video || null;
+      if (!d.title) return res.status(400).json({ ok: false, error: 'Please give the sermon a title.' });
+      if (!audio && !video) return res.status(400).json({ ok: false, error: 'Add an audio file, a video, or both.' });
+      if (audio && !String(audio.key || '').startsWith('audio/')) return res.status(400).json({ ok: false, error: 'Bad audio file.' });
+      if (video && !String(video.key || '').startsWith('video/')) return res.status(400).json({ ok: false, error: 'Bad video file.' });
+      const keys = [audio && audio.key, video && video.key].filter(Boolean);
+
+      let audioSize = 0, videoSize = 0;
+      try {
+        if (audio) audioSize = await finishFile(audio.key, null);
+        if (video) videoSize = await finishFile(video.key, video.uploadId || null);
+      } catch (e) {
+        await removeFiles(keys);
+        return res.status(500).json({ ok: false, error: 'Could not finish the upload: ' + e.message });
+      }
+
+      let used;
+      try { used = await storageUsed(); } catch (e) { await removeFiles(keys); return res.status(500).json({ ok: false, error: e.message }); }
+      if (used + audioSize + videoSize > STORAGE_CAP_BYTES) {
+        await removeFiles(keys);
+        return res.status(400).json({ ok: false, error: 'Storage limit reached. Delete something before uploading more.' });
+      }
+
+      const mediaRows = [];
+      if (audio) mediaRows.push({ b2_key: audio.key, kind: 'audio', content_type: audio.contentType, original_name: audio.originalName, size_bytes: audioSize });
+      if (video) mediaRows.push({ b2_key: video.key, kind: 'video', content_type: video.contentType, original_name: video.originalName, size_bytes: videoSize });
+      const { error: me } = await supabase.from('media_files').insert(mediaRows);
+      if (me) { await removeFiles(keys); return res.status(500).json({ ok: false, error: me.message }); }
+
+      const secs = Number(d.length_seconds);
+      const { data: created, error } = await supabase.from('sermons').insert({
+        title: d.title,
+        preacher: d.preacher || null,
+        sermon_date: d.sermon_date || null,
+        length_seconds: d.length_seconds != null && d.length_seconds !== '' && isFinite(secs) ? Math.round(secs) : null,
+        audio_url: audio ? audio.key : null,
+        video_url: video ? video.key : null
+      }).select().single();
+      if (error) { await removeFiles(keys); return res.status(500).json({ ok: false, error: error.message }); }
+      return res.status(200).json({ ok: true, row: created });
+    }
+
+    // Clean up files that were uploaded but never became part of anything.
+    // Files that ARE in use (counted in media_files) are never touched.
+    if (body.action === 'discard-upload') {
+      const keys = (Array.isArray(body.keys) ? body.keys : [])
+        .filter(k => typeof k === 'string' && /^(audio|video|thumbnail|image)\//.test(k)).slice(0, 10);
+      if (!keys.length) return res.status(200).json({ ok: true, removed: 0 });
+      const { data: tracked } = await supabase.from('media_files').select('b2_key').in('b2_key', keys);
+      const inUse = new Set((tracked || []).map(t => t.b2_key));
+      const orphans = keys.filter(k => !inUse.has(k));
+      await removeFiles(orphans);
+      return res.status(200).json({ ok: true, removed: orphans.length });
     }
 
     // Put already-uploaded photos into an album.

@@ -354,6 +354,19 @@ footer .copy{width:100%;border-top:1px solid rgba(255,255,255,.14);margin-top:16
 #vplayer .vp-dl{flex:none;color:#fff;background:rgba(255,255,255,.18);padding:9px 16px;border-radius:20px;font-weight:600;font-size:13.5px;display:inline-flex;gap:8px;align-items:center}
 #vplayer .vp-close{position:absolute;top:10px;right:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.16);color:#fff;border:0;display:grid;place-items:center;cursor:pointer}
 
+/* Sermon player (audio and video) */
+#splayer{position:fixed;inset:0;z-index:215;background:rgba(10,8,16,.96);display:none;align-items:center;justify-content:center;padding:56px 12px 20px}
+#splayer.open{display:flex}
+#splayer .sp-inner{width:100%;max-width:960px}
+#splayer.audio .sp-inner{max-width:520px;background:rgba(255,255,255,.08);border-radius:16px;padding:22px 18px}
+#splayer .sp-el{width:100%;display:block}
+#splayer video.sp-el{max-height:calc(100vh - 170px);max-height:calc(100dvh - 170px);background:#000;border-radius:10px}
+#splayer .sp-msg{display:none;color:#fff;background:rgba(255,255,255,.12);padding:10px 14px;border-radius:8px;margin-top:10px;font-size:14px}
+#splayer .sp-bar{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:14px;color:#fff}
+#splayer .sp-title{font-weight:600;font-size:15px;min-width:0}
+#splayer .sp-dl{flex:none;color:#fff;background:rgba(255,255,255,.18);padding:9px 16px;border-radius:20px;font-weight:600;font-size:13.5px;display:inline-flex;gap:8px;align-items:center}
+#splayer .sp-close{position:absolute;top:10px;right:10px;width:44px;height:44px;border-radius:50%;background:rgba(255,255,255,.16);color:#fff;border:0;display:grid;place-items:center;cursor:pointer}
+
 </style>
 </head>
 <body>
@@ -466,7 +479,7 @@ function adapt(api){
       id:a.id, ministry:minName(a.ministry_id), title:a.title, count:albumCounts[a.id]||0, img:a.cover_url||null
     })),
     sermons:(api.sermons||[]).map(s=>({
-      id:s.id, title:s.title, who:s.preacher||"", date:fmtDate(s.sermon_date), len:"" 
+      id:s.id, title:s.title, who:s.preacher||"", date:fmtDate(s.sermon_date), len:fmtMin(s.length_seconds), hasAudio:!!s.has_audio, hasVideo:!!s.has_video 
     })),
     leaders:(api.leaders||[]).map(l=>({id:l.id,name:l.name,role:l.role,note:l.note||"",img:l.photo_url||null}))
   };
@@ -585,7 +598,7 @@ function albumCard(a,i){
       <div class="meta">${a.ministry}</div>
     </div></a>`;
 }
-function sermonCard(s){
+function sermonCardOld(s){
   return `<article class="card sermon">
     <div class="sicon"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/>
       <path d="m10 8.8 6 3.2-6 3.2z"/></svg></div>
@@ -1057,6 +1070,115 @@ document.addEventListener('click', async function(e){
 });
 document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeVideo(); });
 window.addEventListener('hashchange', closeVideo);
+
+/* ---------- Sermons: Listen / Watch / Download ---------- */
+function fmtMin(sec){
+  if(!sec) return '';
+  return sec < 90 ? sec + ' sec' : Math.round(sec / 60) + ' min';
+}
+
+function sermonCard(s){
+  const listenIcon = '<svg class="icon icon-sm" viewBox="0 0 24 24"><path d="M11 5 6.5 9H3v6h3.5L11 19z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/></svg>';
+  const watchIcon = '<svg class="icon icon-sm" viewBox="0 0 24 24"><rect x="2.5" y="6" width="13" height="12" rx="2"/><path d="m15.5 12 6-3.5v7z"/></svg>';
+  const meta2 = [s.date, s.len].filter(Boolean).join(' · ');
+  const actions =
+    (s.hasAudio ? '<a class="link" href="#" data-sermon-play="'+s.id+'" data-kind="audio">'+listenIcon+'Listen</a>' : '') +
+    (s.hasVideo ? '<a class="link" href="#" data-sermon-play="'+s.id+'" data-kind="video">'+watchIcon+'Watch</a>' : '') +
+    (s.hasAudio ? '<a class="link muted" href="#" data-sermon-dl="'+s.id+'" data-kind="audio" title="Download audio">'+dlIcon+(s.hasVideo ? ' Audio' : '')+'</a>' : '') +
+    (s.hasVideo ? '<a class="link muted" href="#" data-sermon-dl="'+s.id+'" data-kind="video" title="Download video">'+dlIcon+(s.hasAudio ? ' Video' : '')+'</a>' : '');
+  return '<article class="card sermon">' +
+    '<div class="sicon"><svg class="icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8.8 6 3.2-6 3.2z"/></svg></div>' +
+    '<div class="card-body"><h4>'+s.title+'</h4>' +
+      (s.who ? '<div class="meta">'+s.who+'</div>' : '') +
+      '<div class="meta">'+meta2+'</div>' +
+      '<div class="card-foot">'+(actions || '<span class="meta">Recording coming soon</span>')+'</div></div></article>';
+}
+
+async function fetchSermon(id){
+  const r = await fetch('/api/content?sermon=' + encodeURIComponent(id));
+  const d = await r.json();
+  if(!d.ok) throw new Error(d.error || 'Could not load this sermon.');
+  return d.sermon;
+}
+
+async function openSermon(id, kind){
+  let box = document.getElementById('splayer');
+  if(!box){
+    box = document.createElement('div');
+    box.id = 'splayer';
+    box.innerHTML =
+      '<button class="sp-close" aria-label="Close"><svg class="icon" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg></button>' +
+      '<div class="sp-inner">' +
+        '<div class="sp-media"></div>' +
+        '<div class="sp-msg"></div>' +
+        '<div class="sp-bar"><div class="sp-title"></div><a class="sp-dl" href="#">' + dlIcon + ' Download</a></div>' +
+      '</div>';
+    document.body.appendChild(box);
+    box.querySelector('.sp-close').onclick = closeSermon;
+    box.addEventListener('click', function(e){ if(e.target === box) closeSermon(); });
+  }
+  const media = box.querySelector('.sp-media');
+  const msg = box.querySelector('.sp-msg');
+  const card = db.sermons.find(function(x){ return String(x.id) === String(id); });
+  media.innerHTML = '';
+  msg.style.display = 'none';
+  box.querySelector('.sp-title').textContent = card ? card.title : '';
+  box.classList.toggle('audio', kind === 'audio');
+  box.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  try{
+    const s = await fetchSermon(id);
+    if(!box.classList.contains('open')) return;           // closed while loading
+    const item = kind === 'audio' ? s.audio : s.video;
+    if(!item) throw new Error('This recording is not available yet.');
+    const el = document.createElement(kind === 'audio' ? 'audio' : 'video');
+    el.className = 'sp-el';
+    el.controls = true;
+    el.preload = 'metadata';
+    if(kind !== 'audio') el.setAttribute('playsinline', '');
+    el.addEventListener('error', function(){
+      if(!el.getAttribute('src')) return;
+      msg.textContent = 'This recording could not be played. Please refresh the page and try again.';
+      msg.style.display = 'block';
+    });
+    media.appendChild(el);
+    el.src = item.src;
+    box.querySelector('.sp-dl').href = item.download;
+    const p = el.play();
+    if(p && p.catch) p.catch(function(){});
+  }catch(err){
+    msg.textContent = err.message;
+    msg.style.display = 'block';
+  }
+}
+
+function closeSermon(){
+  const box = document.getElementById('splayer');
+  if(!box) return;
+  const el = box.querySelector('.sp-el');
+  if(el){ el.pause(); el.removeAttribute('src'); el.load(); }
+  box.querySelector('.sp-media').innerHTML = '';
+  box.classList.remove('open');
+  document.body.style.overflow = '';
+}
+
+document.addEventListener('click', async function(e){
+  const p = e.target.closest('[data-sermon-play]');
+  if(p){ e.preventDefault(); openSermon(p.dataset.sermonPlay, p.dataset.kind); return; }
+  const d = e.target.closest('[data-sermon-dl]');
+  if(d){
+    e.preventDefault();
+    toast('Preparing your download…');
+    try{
+      const s = await fetchSermon(d.dataset.sermonDl);
+      const item = d.dataset.kind === 'audio' ? s.audio : s.video;
+      if(!item) throw new Error('This recording is not available yet.');
+      window.location.href = item.download;
+    }catch(err){ toast(err.message); }
+  }
+});
+document.addEventListener('keydown', function(e){ if(e.key === 'Escape') closeSermon(); });
+window.addEventListener('hashchange', closeSermon);
 
 window.addEventListener('hashchange',()=>{window.scrollTo(0,0);render();});
 boot();

@@ -97,6 +97,9 @@ function formFor(t){
     <div class="field"><label>Title</label><input id="f_title" placeholder="The God Who Restores"></div>
     <div class="field"><label>Preacher</label><input id="f_preacher" placeholder="Rev. J. Mwenda"></div>
     <div class="field"><label>Date</label><input id="f_sermon_date" type="date"></div>
+    <div class="field"><label>Audio (optional)</label><input type="file" id="audio_file" accept="audio/*"><div style="font-size:12px;color:#857d91;margin-top:5px">MP3 or M4A works best. Up to 500MB.</div></div>
+    <div class="field"><label>Video (optional)</label><input type="file" id="video_file" accept="video/*"><div style="font-size:12px;color:#857d91;margin-top:5px">MP4 (H.264), up to 720p. Add audio, video, or both. Large videos upload in chunks automatically. Keep this page open until it finishes.</div></div>
+    <div id="vprog" style="display:none;margin-bottom:12px"><div style="height:8px;background:#e4e1e9;border-radius:4px;overflow:hidden"><div id="vbar" style="height:100%;width:0;background:var(--accent)"></div></div><div id="vtxt" style="font-size:12.5px;color:#857d91;margin-top:5px"></div></div>
     <button class="btn" id="addBtn">Publish sermon</button>\`;
   return \`
     <div class="field"><label>Name</label><input id="f_name" placeholder="Mrs. A. Kanana"></div>
@@ -118,7 +121,17 @@ function rowLabel(t, r){
     var n = (content.photos || []).filter(function(p){ return p.album_id === r.id; }).length;
     return [r.title, n + (n === 1 ? ' photo' : ' photos')];
   }
-  if (t==='sermons') return [r.title, (r.preacher||'')+' · '+(r.sermon_date||'')];
+  if (t==='sermons') {
+    var sb = [];
+    if (r.preacher) sb.push(r.preacher);
+    if (r.sermon_date) sb.push(r.sermon_date);
+    if (r.length_seconds) sb.push(fmtDuration(r.length_seconds));
+    var kinds = [];
+    if (r.has_audio) kinds.push('audio');
+    if (r.has_video) kinds.push('video');
+    if (kinds.length) sb.push(kinds.join(' + '));
+    return [r.title, sb.join(' · ')];
+  }
   return [r.name, r.role||''];
 }
 
@@ -216,6 +229,7 @@ async function addItem(){
 
   if (tab === 'albums') { await createAlbum(btn, label, data); return; }
   if (tab === 'videos') { await publishVideo(btn, label, data); return; }
+  if (tab === 'sermons') { await publishSermon(btn, label, data); return; }
 
   const payload = { table: tab, data: data };
   btn.disabled = true;
@@ -451,6 +465,139 @@ async function publishVideo(btn, label, data){
   } catch (e) {
     if (started) { try { await adminPost({ action:'video-abort', key:started.key, uploadId:started.uploadId }); } catch (e2) {} }
     alert('The video could not be uploaded: ' + e.message);
+    stop();
+  }
+}
+
+const AUDIO_MAX = 500 * 1024 * 1024;   // audio is always uploaded in one piece
+const AUDIO_TYPES = { mp3:'audio/mpeg', m4a:'audio/mp4', aac:'audio/aac', wav:'audio/wav', ogg:'audio/ogg', oga:'audio/ogg', opus:'audio/ogg', flac:'audio/flac' };
+
+// Work out an audio file's type (some phones leave it blank, so fall back to the file ending).
+function audioTypeOf(file){
+  if (file.type && file.type.startsWith('audio/')) return file.type;
+  var dot = file.name.lastIndexOf('.');
+  var ext = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : '';
+  return AUDIO_TYPES[ext] || null;
+}
+
+// Ask the browser for the audio's length (this also proves the browser can play it).
+function readAudioInfo(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file);
+    var a = document.createElement('audio');
+    a.preload = 'metadata';
+    var timer = setTimeout(function(){ done(); resolve({ duration: null }); }, 10000);
+    function done(){ clearTimeout(timer); URL.revokeObjectURL(url); }
+    a.onloadedmetadata = function(){ done(); resolve({ duration: a.duration }); };
+    a.onerror = function(){ done(); reject(new Error('unreadable')); };
+    a.src = url;
+  });
+}
+
+async function publishSermon(btn, label, data){
+  const audioInput = document.getElementById('audio_file');
+  const videoInput = document.getElementById('video_file');
+  const box = document.getElementById('vprog');
+  const bar = document.getElementById('vbar');
+  const txt = document.getElementById('vtxt');
+  const audio = audioInput && audioInput.files[0];
+  const video = videoInput && videoInput.files[0];
+  if (!audio && !video) { alert('Please choose an audio file, a video, or both.'); return; }
+
+  var vinfo = null;
+  var ainfo = null;
+  var audioKey = null;
+  var videoKey = null;
+  var started = null;   // set once a chunked video upload has begun, so it can be cancelled if something fails
+  function stop(){
+    uploadBusy = false;
+    btn.disabled = false;
+    btn.textContent = label;
+    box.style.display = 'none';
+    bar.style.width = '0';
+    if (vinfo && vinfo.cleanup) vinfo.cleanup();
+  }
+  uploadBusy = true;
+  btn.disabled = true;
+  try {
+    var audioType = null;
+    if (audio) {
+      audioType = audioTypeOf(audio);
+      if (!audioType) { alert('Please choose an audio file (MP3 or M4A work best).'); stop(); return; }
+      if (audio.size > AUDIO_MAX) { alert('failed: audio file above 500mbs'); stop(); return; }
+      btn.textContent = 'Checking audio…';
+      try { ainfo = await readAudioInfo(audio); }
+      catch (e) { alert('This audio file could not be read by your browser. Please use MP3 or M4A.'); stop(); return; }
+    }
+    if (video) {
+      if (!video.type.startsWith('video/')) { alert('Please choose a video file.'); stop(); return; }
+      btn.textContent = 'Checking video…';
+      try { vinfo = await readVideoInfo(video); }
+      catch (e) { alert('This video could not be read by your browser. Please use an MP4 (H.264) video.'); stop(); return; }
+      if (Math.min(vinfo.width, vinfo.height) > MAX_VIDEO_SIDE) { alert('failed: video size above 720p'); stop(); return; }
+    }
+
+    var total = (audio ? audio.size : 0) + (video ? video.size : 0);
+    var sent = 0;
+    box.style.display = 'block';
+    function show(loadedNow){
+      var pct = Math.min(100, Math.round(((sent + loadedNow) / total) * 100));
+      bar.style.width = pct + '%';
+      txt.textContent = 'Uploading… ' + pct + '%';
+      btn.textContent = pct + '%';
+    }
+    show(0);
+
+    var audioMeta = null;
+    var videoMeta = null;
+    if (audio) {
+      var a = await adminPost({ action:'get-upload-url', kind:'audio', filename:audio.name, contentType:audioType, sizeBytes:audio.size });
+      audioKey = a.key;
+      await putWithRetry(a.uploadUrl, audio, audioType, 3, show);
+      sent += audio.size;
+      audioMeta = { key: a.key, contentType: audioType, originalName: audio.name };
+    }
+    if (video) {
+      var parts = planChunks(video.size);
+      if (parts.length === 1) {
+        var one = await adminPost({ action:'get-upload-url', kind:'video', filename:video.name, contentType:video.type, sizeBytes:video.size });
+        videoKey = one.key;
+        await putWithRetry(one.uploadUrl, video, video.type, 3, show);
+        sent += video.size;
+        videoMeta = { key: one.key, uploadId: null, contentType: video.type, originalName: video.name };
+      } else {
+        var st = await adminPost({ action:'video-start', filename:video.name, contentType:video.type, sizeBytes:video.size, partCount:parts.length });
+        started = { key: st.key, uploadId: st.uploadId };
+        for (var i = 0; i < parts.length; i++) {
+          await putWithRetry(st.partUrls[i], video.slice(parts[i].start, parts[i].end), null, 3, show);
+          sent += parts[i].end - parts[i].start;
+        }
+        videoMeta = { key: st.key, uploadId: st.uploadId, contentType: video.type, originalName: video.name };
+      }
+    }
+    sent = total;
+    show(0);
+    btn.textContent = 'Finishing…';
+    txt.textContent = 'Finishing…';
+    var secs = null;
+    if (vinfo && isFinite(vinfo.duration)) secs = Math.round(vinfo.duration);
+    else if (ainfo && ainfo.duration && isFinite(ainfo.duration)) secs = Math.round(ainfo.duration);
+    await adminPost({
+      action: 'finish-sermon',
+      data: { title: data.title, preacher: data.preacher, sermon_date: data.sermon_date, length_seconds: secs },
+      audio: audioMeta,
+      video: videoMeta
+    });
+    stop();
+    await loadContent();
+  } catch (e) {
+    // clean up anything that was uploaded but never became part of a sermon
+    if (started) { try { await adminPost({ action:'video-abort', key:started.key, uploadId:started.uploadId }); } catch (e2) {} }
+    var orphans = [];
+    if (audioKey) orphans.push(audioKey);
+    if (videoKey) orphans.push(videoKey);
+    if (orphans.length) { try { await adminPost({ action:'discard-upload', keys:orphans }); } catch (e3) {} }
+    alert('The sermon could not be uploaded: ' + e.message);
     stop();
   }
 }

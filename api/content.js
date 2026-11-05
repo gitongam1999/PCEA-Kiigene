@@ -49,6 +49,22 @@ module.exports = async (req, res) => {
       });
     }
 
+    // One sermon's playing and download links (audio and/or video), made fresh when a visitor taps.
+    if (req.query && req.query.sermon) {
+      const { data: s, error } = await supabase.from('sermons')
+        .select('id, title, preacher, audio_url, video_url').eq('id', req.query.sermon).single();
+      if (error || !s || (!s.audio_url && !s.video_url)) return res.status(404).json({ ok: false, error: 'Sermon not found.' });
+      const SIX_HOURS = 6 * 60 * 60;
+      const pack = async key => key ? {
+        src: await sign(key, undefined, SIX_HOURS),
+        download: await sign(key, niceName(key), SIX_HOURS)
+      } : null;
+      return res.status(200).json({
+        ok: true,
+        sermon: { id: s.id, title: s.title, preacher: s.preacher, audio: await pack(s.audio_url), video: await pack(s.video_url) }
+      });
+    }
+
     const [church, ministries, events, videos, albums, photos, sermons, leaders] = await Promise.all([
       supabase.from('church_info').select('*').eq('id', 1).single(),
       supabase.from('ministries').select('*').order('sort_order'),
@@ -86,6 +102,18 @@ module.exports = async (req, res) => {
       has_file: !!v.file_url
     })));
 
+    // Sermons: the files themselves are signed when someone taps Listen or Watch.
+    const sermonCards = (sermons.data || []).map(s => ({
+      id: s.id,
+      title: s.title,
+      preacher: s.preacher,
+      sermon_date: s.sermon_date,
+      length_seconds: s.length_seconds,
+      created_at: s.created_at,
+      has_audio: !!s.audio_url,
+      has_video: !!s.video_url
+    }));
+
     res.status(200).json({
       ok: true,
       church: church.data || null,
@@ -94,7 +122,7 @@ module.exports = async (req, res) => {
       videos: videoCards,
       albums: albums.data || [],
       photos: (photos.data || []).map(p => ({ id: p.id, album_id: p.album_id })),
-      sermons: sermons.data || [],
+      sermons: sermonCards,
       leaders: leaders.data || []
     });
   } catch (e) {
