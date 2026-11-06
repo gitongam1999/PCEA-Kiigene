@@ -3,11 +3,11 @@ const { isAdmin } = require('./_session');
 const { s3, BUCKET, presignPut, presignUploadPart } = require('./_storage');
 const {
   DeleteObjectCommand, CreateMultipartUploadCommand, CompleteMultipartUploadCommand,
-  ListPartsCommand, AbortMultipartUploadCommand, ListMultipartUploadsCommand, HeadObjectCommand
+  ListPartsCommand, AbortMultipartUploadCommand, ListMultipartUploadsCommand, HeadObjectCommand, ListObjectsV2Command
 } = require('@aws-sdk/client-s3');
 
 const ALLOWED = ['events', 'videos', 'albums', 'sermons', 'leaders'];
-const STORAGE_CAP_BYTES = 9.5 * 1024 * 1024 * 1024;
+const STORAGE_CAP_BYTES = 9.5 * 1000 * 1000 * 1000;   // Backblaze counts 1 GB as 1,000,000,000 bytes; the free tier is 10 GB
 const IMAGE_MAX_BYTES = 30 * 1024 * 1024;
 const VIDEO_SINGLE_MAX = 500 * 1024 * 1024;   // bigger videos must be uploaded in chunks
 const VIDEO_MAX_PARTS = 40;
@@ -77,6 +77,87 @@ async function abortStaleUploads() {
       }
     }
   } catch (e) {}
+}
+
+// Everything currently in the bucket (name, size, last-changed time).
+async function listBucket() {
+  const files = [];
+  let token;
+  let pages = 0;
+  do {
+    const out = await s3.send(new ListObjectsV2Command({ Bucket: BUCKET, ContinuationToken: token }));
+    (out.Contents || []).forEach(o => files.push({ key: o.Key, size: o.Size || 0, modified: o.LastModified }));
+    token = out.IsTruncated ? out.NextContinuationToken : undefined;
+    pages++;
+  } while (token && pages < 20);
+  return files;
+}
+
+// Which part of the site uses each stored file: key -> { type, id, label }
+async function usageMap() {
+  const [events, leaders, ministries, church, videos, sermons, photos, albums] = await Promise.all([
+    supabase.from('events').select('id, title, image_url'),
+    supabase.from('leaders').select('id, name, photo_url'),
+    supabase.from('ministries').select('id, name, cover_url'),
+    supabase.from('church_info').select('id, cover_url'),
+    supabase.from('videos').select('id, title, file_url, thumbnail_url'),
+    supabase.from('sermons').select('id, title, audio_url, video_url'),
+    supabase.from('photos').select('id, album_id, file_url'),
+    supabase.from('albums').select('id, title')
+  ]);
+  const map = new Map();
+  const add = (key, u) => { if (key) map.set(key, u); };
+  (events.data || []).forEach(r => add(r.image_url, { type: 'event', id: r.id, label: 'Event: ' + r.title }));
+  (leaders.data || []).forEach(r => add(r.photo_url, { type: 'leader', id: r.id, label: 'Leadership: ' + r.name }));
+  (ministries.data || []).forEach(r => add(r.cover_url, { type: 'ministry-cover', id: r.id, label: 'Cover: ' + r.name }));
+  (church.data || []).forEach(r => add(r.cover_url, { type: 'home-cover', id: r.id, label: 'Cover: Home page' }));
+  (videos.data || []).forEach(r => {
+    add(r.file_url, { type: 'video', id: r.id, label: 'Video: ' + r.title });
+    add(r.thumbnail_url, { type: 'video-thumb', id: r.id, label: 'Thumbnail of video: ' + r.title });
+  });
+  (sermons.data || []).forEach(r => {
+    add(r.audio_url, { type: 'sermon-audio', id: r.id, label: 'Sermon audio: ' + r.title });
+    add(r.video_url, { type: 'sermon-video', id: r.id, label: 'Sermon video: ' + r.title });
+  });
+  const albumTitle = {};
+  (albums.data || []).forEach(x => { albumTitle[x.id] = x.title; });
+  (photos.data || []).forEach(r => add(r.file_url, { type: 'photo', id: r.id, label: 'Album photo: ' + (albumTitle[r.album_id] || 'album') }));
+  return map;
+}
+
+// Take a file out of whatever uses it, so the site never points at a missing file.
+// Returns any extra file keys that should be deleted along with it.
+async function detach(u) {
+  switch (u.type) {
+    case 'event': await supabase.from('events').update({ image_url: null }).eq('id', u.id); break;
+    case 'leader': await supabase.from('leaders').update({ photo_url: null }).eq('id', u.id); break;
+    case 'ministry-cover': await supabase.from('ministries').update({ cover_url: null }).eq('id', u.id); break;
+    case 'home-cover': await supabase.from('church_info').update({ cover_url: null }).eq('id', u.id); break;
+    case 'photo': await supabase.from('photos').delete().eq('id', u.id); break;
+    case 'video-thumb': await supabase.from('videos').update({ thumbnail_url: null }).eq('id', u.id); break;
+    case 'video': {
+      // a video is useless without its file: remove the whole entry, and its thumbnail with it
+      const { data: v } = await supabase.from('videos').select('thumbnail_url').eq('id', u.id).single();
+      await supabase.from('videos').delete().eq('id', u.id);
+      return v && v.thumbnail_url ? [v.thumbnail_url] : [];
+    }
+    case 'sermon-audio':
+    case 'sermon-video': {
+      const col = u.type === 'sermon-audio' ? 'audio_url' : 'video_url';
+      await supabase.from('sermons').update({ [col]: null }).eq('id', u.id);
+      const { data: s } = await supabase.from('sermons').select('audio_url, video_url').eq('id', u.id).single();
+      if (s && !s.audio_url && !s.video_url) await supabase.from('sermons').delete().eq('id', u.id);
+      break;
+    }
+  }
+  return [];
+}
+
+// Delete one stored file and remove it from whatever uses it.
+async function deleteFileKey(key, usage) {
+  const extra = usage ? await detach(usage) : [];
+  await removeFiles([key].concat(extra));
+  return extra.length + 1;
 }
 
 // The Home page's cover photo lives on the church_info row.
@@ -327,6 +408,82 @@ module.exports = async (req, res) => {
       const orphans = keys.filter(k => !inUse.has(k));
       await removeFiles(orphans);
       return res.status(200).json({ ok: true, removed: orphans.length });
+    }
+
+    // A small summary for the bar at the top of the dashboard (cheap: reads only your own records).
+    if (body.action === 'storage-summary') {
+      try { return res.status(200).json({ ok: true, used: await storageUsed(), cap: STORAGE_CAP_BYTES }); }
+      catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+    }
+
+    // Everything for the Storage tab: the meter, every file (newest first), and a check against Backblaze.
+    if (body.action === 'storage-report') {
+      const [tr, usage] = await Promise.all([
+        supabase.from('media_files').select('id, b2_key, kind, original_name, size_bytes, created_at').order('created_at', { ascending: false }),
+        usageMap()
+      ]);
+      if (tr.error) return res.status(500).json({ ok: false, error: tr.error.message });
+      const tracked = tr.data || [];
+      const used = tracked.reduce((t, m) => t + (m.size_bytes || 0), 0);
+      const files = tracked.map(m => {
+        const u = usage.get(m.b2_key);
+        return { key: m.b2_key, kind: m.kind, name: m.original_name || String(m.b2_key).split('/').pop(),
+                 size: m.size_bytes || 0, created: m.created_at, usedBy: u ? u.label : null, usedType: u ? u.type : null };
+      });
+      let listing = null, listError = null;
+      try { listing = await listBucket(); } catch (e) { listError = e.message; }
+      let b2 = null, missing = [], orphans = [];
+      if (listing) {
+        const inB2 = new Set(listing.map(f => f.key));
+        const trackedKeys = new Set(tracked.map(m => m.b2_key));
+        b2 = { count: listing.length, bytes: listing.reduce((t, f) => t + f.size, 0) };
+        const gone = new Set();
+        tracked.forEach(m => { if (!inB2.has(m.b2_key)) gone.add(m.b2_key); });
+        usage.forEach((u, k) => { if (!inB2.has(k)) gone.add(k); });
+        missing = Array.from(gone).map(k => ({ key: k, usedBy: usage.get(k) ? usage.get(k).label : null }));
+        orphans = listing.filter(f => !trackedKeys.has(f.key)).map(f => ({ key: f.key, size: f.size, modified: f.modified }));
+      }
+      return res.status(200).json({ ok: true, cap: STORAGE_CAP_BYTES, used, files, b2, missing, orphans, listError });
+    }
+
+    // Delete one file from the Storage list and remove it from whatever uses it.
+    if (body.action === 'delete-file') {
+      const key = body.key;
+      if (typeof key !== 'string' || !/^(audio|video|thumbnail|image|cover)\//.test(key)) {
+        return res.status(400).json({ ok: false, error: 'Bad file name.' });
+      }
+      const usage = (await usageMap()).get(key) || null;
+      const count = await deleteFileKey(key, usage);
+      return res.status(200).json({ ok: true, removed: count, wasUsedBy: usage ? usage.label : null });
+    }
+
+    // Tidy up after the bucket and the records stop matching.
+    //   missing: records that point at files no longer in Backblaze -> remove them from the site
+    //   orphans: files in Backblaze that nothing uses (older than an hour, so uploads in progress are safe) -> delete
+    if (body.action === 'storage-repair') {
+      const mode = body.mode;
+      if (mode !== 'missing' && mode !== 'orphans') return res.status(400).json({ ok: false, error: 'Unknown repair.' });
+      let listing;
+      try { listing = await listBucket(); }
+      catch (e) { return res.status(500).json({ ok: false, error: 'Could not read Backblaze, so nothing was changed: ' + e.message }); }
+      const inB2 = new Set(listing.map(f => f.key));
+
+      if (mode === 'orphans') {
+        const { data: tr } = await supabase.from('media_files').select('b2_key');
+        const trackedKeys = new Set((tr || []).map(m => m.b2_key));
+        const unused = listing.filter(f => !trackedKeys.has(f.key));
+        const cutoff = Date.now() - 60 * 60 * 1000;
+        const old = unused.filter(f => f.modified && new Date(f.modified).getTime() < cutoff);
+        await removeFiles(old.map(f => f.key));
+        return res.status(200).json({ ok: true, removed: old.length, bytes: old.reduce((t, f) => t + f.size, 0), skippedRecent: unused.length - old.length });
+      }
+
+      const [tr, usage] = await Promise.all([supabase.from('media_files').select('b2_key'), usageMap()]);
+      const gone = new Set();
+      (tr.data || []).forEach(m => { if (!inB2.has(m.b2_key)) gone.add(m.b2_key); });
+      usage.forEach((u, k) => { if (!inB2.has(k)) gone.add(k); });
+      for (const k of gone) await deleteFileKey(k, usage.get(k));
+      return res.status(200).json({ ok: true, cleaned: gone.size });
     }
 
     // Put already-uploaded photos into an album.

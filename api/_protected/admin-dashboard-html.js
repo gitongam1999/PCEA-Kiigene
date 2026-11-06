@@ -53,14 +53,15 @@ module.exports = `<!DOCTYPE html>
 </header>
 <div class="wrap">
   <div class="tabs" id="tabs"></div>
+  <div id="storageBar" style="display:flex;align-items:center;gap:10px;font-size:12.5px;color:#514a5c;margin:-6px 0 14px"></div>
   <div class="split">
     <div class="panel" id="formPanel"><h3 id="formTitle">Add</h3><div id="formArea"></div></div>
-    <div class="panel"><h3 id="listTitle">Current</h3><div id="listArea"><div class="msg">Loading…</div></div></div>
+    <div class="panel" id="listPanel"><h3 id="listTitle">Current</h3><div id="listArea"><div class="msg">Loading…</div></div></div>
   </div>
 </div>
 
 <script>
-const TABS = [['ministries','Ministries'],['events','Events'],['videos','Videos'],['albums','Photos'],['sermons','Sermons'],['leaders','Leadership']];
+const TABS = [['ministries','Ministries'],['events','Events'],['videos','Videos'],['albums','Photos'],['sermons','Sermons'],['leaders','Leadership'],['storage','Storage']];
 let tab = 'events';
 let content = null;
 let openAlbum = null;   // the album being managed, or null
@@ -140,6 +141,7 @@ async function loadContent(){
   content = await r.json();
   if (!content.ok) { document.getElementById('listArea').innerHTML = '<div class="err">'+content.error+'</div>'; return; }
   render();
+  refreshStorageBar();
 }
 
 function render(){
@@ -147,6 +149,8 @@ function render(){
     '<button class="tab '+(k===tab?'on':'')+'" data-tab="'+k+'">'+l+'</button>').join('');
   document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => { tab = b.dataset.tab; openAlbum = null; render(); });
 
+  document.getElementById('listPanel').style.gridColumn = '';
+  if (tab === 'storage') { renderStorage(); return; }
   if (tab === 'albums' && openAlbum) { renderAlbumDetail(); return; }
   if (tab === 'ministries') { renderMinistries(); return; }
   document.getElementById('formPanel').style.display = '';
@@ -600,6 +604,112 @@ async function publishSermon(btn, label, data){
     alert('The sermon could not be uploaded: ' + e.message);
     stop();
   }
+}
+
+// Sizes the way Backblaze counts them: 1 GB = 1,000,000,000 bytes.
+function fmtBytes(n){
+  n = n || 0;
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + ' GB';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' MB';
+  return Math.round(n / 1e3) + ' KB';
+}
+
+// The slim bar under the tabs: how much of the free space is used.
+async function refreshStorageBar(){
+  const el = document.getElementById('storageBar');
+  if (!el) return;
+  try {
+    const d = await adminPost({ action: 'storage-summary' });
+    const pct = Math.min(100, Math.round(d.used / d.cap * 100));
+    const color = pct >= 95 ? 'var(--red)' : (pct >= 80 ? '#e08a00' : 'var(--accent)');
+    el.innerHTML = '<span>Storage: <b>' + fmtBytes(d.used) + '</b> of ' + fmtBytes(d.cap) + ' used</span>' +
+      '<span style="flex:1;max-width:240px;height:6px;background:#e4e1e9;border-radius:3px;overflow:hidden;display:block"><span style="display:block;width:' + pct + '%;height:100%;background:' + color + '"></span></span>' +
+      '<span>' + pct + '%</span>';
+  } catch (e) { el.innerHTML = ''; }
+}
+
+// Plain-words warning shown before a file is deleted.
+function describeDelete(f){
+  if (!f.usedType) return 'Delete ' + f.name + '? Nothing on the site uses it.';
+  var tails = {
+    'video': 'This is a video file, so the whole video is removed from the site.',
+    'photo': 'The photo is removed from its album.',
+    'sermon-audio': 'The audio is removed from that sermon (if it has no video, the whole sermon is removed).',
+    'sermon-video': 'The video is removed from that sermon (if it has no audio, the whole sermon is removed).',
+    'video-thumb': 'The video stays, with a plain thumbnail.'
+  };
+  return 'Delete ' + f.name + '? It is used by: ' + f.usedBy + '. ' + (tails[f.usedType] || 'The item stays on the site, without this picture.');
+}
+
+async function renderStorage(){
+  document.getElementById('formPanel').style.display = 'none';
+  document.getElementById('listPanel').style.gridColumn = '1 / -1';
+  document.getElementById('listTitle').textContent = 'Storage';
+  const box = document.getElementById('listArea');
+  box.innerHTML = '<div class="msg">Checking storage…</div>';
+  var d;
+  try { d = await adminPost({ action: 'storage-report' }); }
+  catch (e) { box.innerHTML = '<div class="err">' + e.message + '</div>'; return; }
+  if (tab !== 'storage') return;
+
+  var pct = Math.min(100, Math.round(d.used / d.cap * 100));
+  var color = pct >= 95 ? 'var(--red)' : (pct >= 80 ? '#e08a00' : 'var(--accent)');
+  var html = '<div style="margin-bottom:18px">' +
+    '<div style="display:flex;justify-content:space-between;font-size:14px;margin-bottom:6px"><b>' + fmtBytes(d.used) + ' of ' + fmtBytes(d.cap) + ' used</b><span>' + pct + '%</span></div>' +
+    '<div style="height:12px;background:#e4e1e9;border-radius:6px;overflow:hidden"><div style="width:' + pct + '%;height:100%;background:' + color + '"></div></div>' +
+    '<div style="font-size:12px;color:#857d91;margin-top:6px">' + fmtBytes(Math.max(0, d.cap - d.used)) + ' left. Uploads stop automatically when the limit is reached.' +
+    (d.b2 ? ' Backblaze holds ' + d.b2.count + ' files (' + fmtBytes(d.b2.bytes) + ').' : '') + '</div></div>';
+
+  var warn = 'background:#fff7e6;border-left:3px solid #e08a00;padding:10px 12px;border-radius:0 8px 8px 0;margin-bottom:12px;font-size:13px';
+  if (d.listError) {
+    html += '<div class="err">Could not read Backblaze to check it (' + d.listError + '). The list below comes from your own records.</div>';
+  }
+  if (d.missing && d.missing.length) {
+    var names = d.missing.slice(0, 6).map(function(m){ return m.usedBy || m.key; });
+    html += '<div style="' + warn + '"><b>' + d.missing.length + (d.missing.length === 1 ? ' file is' : ' files are') + ' recorded here but no longer in Backblaze</b> (for example if they were deleted there directly). Anything using them shows a broken picture or video on the site.' +
+      '<div style="margin:6px 0;color:#514a5c">' + names.join(', ') + (d.missing.length > 6 ? ' and more' : '') + '</div>' +
+      '<button class="btn" id="fixMissing" style="padding:7px 14px;font-size:13px">Remove them from the site</button></div>';
+  }
+  if (d.orphans && d.orphans.length) {
+    var ob = d.orphans.reduce(function(t, o){ return t + (o.size || 0); }, 0);
+    html += '<div style="' + warn + '"><b>' + d.orphans.length + (d.orphans.length === 1 ? ' file' : ' files') + ' in Backblaze (' + fmtBytes(ob) + ') ' + (d.orphans.length === 1 ? 'is' : 'are') + ' not used by anything.</b> They take up space but appear nowhere on the site. Files uploaded in the last hour are left alone.' +
+      '<div style="margin-top:8px"><button class="btn" id="fixOrphans" style="padding:7px 14px;font-size:13px">Delete unused files</button></div></div>';
+  }
+  if (d.b2 && !d.missing.length && !d.orphans.length) {
+    html += '<div style="font-size:13px;color:#2f7d4f;margin-bottom:12px">Everything matches Backblaze: no missing files and no unused files.</div>';
+  }
+
+  var shown = d.files.slice(0, 200);
+  html += '<div style="font-size:12.5px;color:#857d91;margin-bottom:8px">' + d.files.length + (d.files.length === 1 ? ' file' : ' files') + ', newest first' + (d.files.length > 200 ? ' (showing the latest 200)' : '') + '</div>';
+  if (!shown.length) html += '<div class="msg">No files yet.</div>';
+  shown.forEach(function(f, i){
+    html += '<div class="row"><span class="t"><b>' + f.name + '</b><span>' + f.kind + ' · ' + fmtBytes(f.size) + ' · ' + String(f.created || '').slice(0, 10) + ' · ' + (f.usedBy ? f.usedBy : 'not used by anything') + '</span></span>' +
+      '<button class="del" data-delfile="' + i + '" title="Delete file">✕</button></div>';
+  });
+  box.innerHTML = html;
+
+  box.querySelectorAll('[data-delfile]').forEach(function(b){
+    b.onclick = async function(){
+      var f = shown[+b.dataset.delfile];
+      if (!confirm(describeDelete(f))) return;
+      try { await adminPost({ action: 'delete-file', key: f.key }); await loadContent(); }
+      catch (e) { alert('Error: ' + e.message); }
+    };
+  });
+  var fm = document.getElementById('fixMissing');
+  if (fm) fm.onclick = async function(){
+    if (!confirm('Remove ' + d.missing.length + ' broken entries from the site? Pictures and recordings that are gone are taken off events, leadership, ministries and albums. Videos and sermons with no file left are deleted entirely. Nothing in Backblaze is touched. Continue?')) return;
+    fm.disabled = true;
+    try { var r = await adminPost({ action: 'storage-repair', mode: 'missing' }); alert('Done. ' + r.cleaned + ' broken entries were removed.'); await loadContent(); }
+    catch (e) { alert('Error: ' + e.message); fm.disabled = false; }
+  };
+  var fo = document.getElementById('fixOrphans');
+  if (fo) fo.onclick = async function(){
+    if (!confirm('Delete ' + d.orphans.length + ' unused files from Backblaze? This cannot be undone.')) return;
+    fo.disabled = true;
+    try { var r = await adminPost({ action: 'storage-repair', mode: 'orphans' }); alert('Done. ' + r.removed + ' unused files were deleted.' + (r.skippedRecent ? ' ' + r.skippedRecent + (r.skippedRecent === 1 ? ' recent one was' : ' recent ones were') + ' left alone.' : '')); await loadContent(); }
+    catch (e) { alert('Error: ' + e.message); fo.disabled = false; }
+  };
 }
 
 async function uploadPhotosToAlbum(albumId, files, progress){
